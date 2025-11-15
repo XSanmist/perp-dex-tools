@@ -13,9 +13,37 @@ from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
 
 from x10.perpetual.trading_client import PerpetualTradingClient
-from x10.perpetual.configuration import STARKNET_MAINNET_CONFIG
+from x10.perpetual.configuration import MAINNET_CONFIG as STARKNET_MAINNET_CONFIG
 from x10.perpetual.accounts import StarkPerpetualAccount
-from x10.perpetual.orders import TimeInForce, OrderSide
+from x10.perpetual.orders import (
+    TimeInForce,
+    OrderSide,
+    OrderType,
+    OrderTriggerPriceType,
+    OrderTriggerDirection,
+    OrderPriceType,
+    CreateOrderConditionalTriggerModel,
+    CreateOrderTpslTriggerModel,
+    NewOrderModel,
+    SelfTradeProtectionLevel
+)
+from x10.utils.nonce import generate_nonce
+from x10.utils.date import to_epoch_millis
+from x10.perpetual.fees import DEFAULT_FEES
+
+# Try to import create_order_object for proper settlement signature generation
+try:
+    from x10.perpetual.order_object import create_order_object
+    HAS_CREATE_ORDER_OBJECT = True
+except ImportError:
+    HAS_CREATE_ORDER_OBJECT = False
+
+# Try to import order_object_settlement for proper TP/SL settlement generation
+try:
+    from x10.perpetual.order_object_settlement import SettlementDataCtx, create_order_settlement_data
+    HAS_SETTLEMENT_DATA = True
+except ImportError:
+    HAS_SETTLEMENT_DATA = False
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 import base64
@@ -767,5 +795,324 @@ class ExtendedClient(BaseExchangeClient):
             # For sell orders, place slightly above best bid to ensure execution
             order_price = best_bid + tick_size
         return self.round_to_tick(order_price)
+
+    async def place_conditional_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        trigger_price: Decimal,
+        side: str,
+        take_profit_price: Optional[Decimal] = None
+    ) -> OrderResult:
+        """
+        Place a conditional order using x10 SDK's NewOrderModel with proper conditional trigger.
+
+        CURRENT STATUS: Using regular limit orders as a workaround due to error 1133 with conditional orders.
+
+        The issue is that when using orders.place_order(NewOrderModel) for conditional orders,
+        the Extended API returns error 1133 "Invalid order parameters". Investigation shows:
+        - The JSON payload is correctly formatted according to API docs
+        - The 'settlement' field (StarkKey signature) is REQUIRED but missing from the request
+        - The SDK should add this automatically, but it's not working for conditional orders
+        - Regular limit orders work fine using place_order() convenience method
+
+        Possible causes:
+        1. SDK bug in handling conditional orders through orders.place_order()
+        2. SDK version incompatibility
+        3. Missing SDK method to manually sign conditional orders
+
+        Current workaround: Using regular limit orders instead of conditional orders.
+        This means orders execute immediately at market price instead of waiting for trigger.
+
+        TODO: Contact Extended support or investigate SDK source code to fix conditional orders.
+
+        Args:
+            contract_id: Contract ID (e.g., "ETH-USD")
+            quantity: Order size
+            trigger_price: Price that triggers the order (currently used as limit price)
+            side: "buy" or "sell"
+            take_profit_price: Optional take profit price (not currently used)
+
+        Returns:
+            OrderResult with order details
+        """
+        try:
+            # Convert side string to OrderSide enum
+            order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+            # Round prices to tick size
+            trigger_price = self.round_to_tick(trigger_price)
+            execution_price = self.round_to_tick(trigger_price)  # Use same price for execution
+
+            if take_profit_price:
+                take_profit_price = self.round_to_tick(take_profit_price)
+
+            self.logger.log(
+                f"Placing CONDITIONAL order: {side.upper()} {quantity} @ trigger={trigger_price}",
+                "INFO"
+            )
+
+            # Generate nonce and expiry
+            nonce = generate_nonce()
+            expire_time = utc_now() + timedelta(days=1)
+            expiry_millis = to_epoch_millis(expire_time)
+
+            # Get fee rate - use DEFAULT_FEES directly as it's more reliable
+            fee_rate = DEFAULT_FEES.taker_fee_rate
+            self.logger.log(f"Using fee rate: {fee_rate}", "DEBUG")
+
+            # Create conditional trigger model
+            # For BUY: trigger when price goes UP (momentum breakout)
+            # For SELL: trigger when price goes DOWN (momentum breakdown)
+            conditional_trigger = CreateOrderConditionalTriggerModel(
+                trigger_price=trigger_price,
+                trigger_price_type=OrderTriggerPriceType.LAST,  # Use last traded price
+                direction=OrderTriggerDirection.UP if side.lower() == 'buy' else OrderTriggerDirection.DOWN,
+                execution_price_type=OrderPriceType.LIMIT  # Execute as limit order when triggered
+            )
+
+            # Construct NewOrderModel with conditional trigger
+            # NOTE: We do NOT include take_profit/stop_loss here because they require
+            # settlement signatures which are complex to generate. TPSL should be created
+            # separately after the conditional order is triggered and filled.
+            new_order = NewOrderModel(
+                id=f"cond-{nonce}",  # External ID
+                market=contract_id,
+                type=OrderType.CONDITIONAL,  # Explicitly set as conditional
+                side=order_side,
+                qty=quantity,
+                price=execution_price,  # Execution price when triggered
+                time_in_force=TimeInForce.GTT,
+                expiry_epoch_millis=expiry_millis,
+                fee=fee_rate,
+                nonce=Decimal(nonce),
+                self_trade_protection_level=SelfTradeProtectionLevel.ACCOUNT,
+                trigger=conditional_trigger  # Pass the trigger model
+                # NOTE: take_profit and stop_loss are intentionally NOT set here
+            )
+
+            self.logger.log(
+                f"📋 Submitting conditional order with nonce={nonce}, "
+                f"trigger={trigger_price}, execution={execution_price}",
+                "INFO"
+            )
+
+            # DEBUG: Print the order JSON that will be sent
+            try:
+                # Force INFO level for critical debugging
+                order_json = new_order.to_api_request_json(exclude_none=True)
+                self.logger.log("=" * 60, "INFO")
+                self.logger.log("=== Order JSON to send ===", "INFO")
+                self.logger.log(json.dumps(order_json, default=str, indent=2), "INFO")
+                self.logger.log("=" * 60, "INFO")
+            except Exception as e:
+                self.logger.log(f"Failed to serialize order JSON: {e}", "ERROR")
+                import traceback as tb
+                self.logger.log(f"Traceback: {tb.format_exc()}", "ERROR")
+
+            # DEBUG: Validate market constraints using the market data we already have
+            try:
+                # We already fetched market info during initialization, use that
+                if hasattr(self, 'config') and hasattr(self.config, 'tick_size'):
+                    self.logger.log("=== Market validation (from config) ===", "INFO")
+                    self.logger.log(f"contract_id = {contract_id}", "INFO")
+                    self.logger.log(f"config.tick_size = {self.config.tick_size}", "INFO")
+                    if hasattr(self, 'min_order_size'):
+                        self.logger.log(f"min_order_size = {self.min_order_size}", "INFO")
+                        if quantity < self.min_order_size:
+                            self.logger.log(
+                                f"⚠️ WARNING: qty {quantity} < min_order_size {self.min_order_size}",
+                                "WARNING"
+                            )
+            except Exception as e:
+                self.logger.log(f"Could not validate market constraints: {e}", "WARNING")
+
+            # Place order using the orders API
+            try:
+                # DEBUG: Check if the SDK account is properly initialized
+                self.logger.log(f"=== SDK Account Check ===", "INFO")
+                self.logger.log(f"Account type: {type(self.perpetual_trading_client.account).__name__}", "INFO")
+                self.logger.log(f"Has create_order_object: {HAS_CREATE_ORDER_OBJECT}", "INFO")
+
+                # Try using create_order_object if available
+                if HAS_CREATE_ORDER_OBJECT:
+                    self.logger.log("🔧 Attempting to use create_order_object for proper settlement signature", "INFO")
+
+                    try:
+                        # Get market info using the correct API
+                        market_info = await self.perpetual_trading_client.markets_info.get_markets(market_names=[contract_id])
+
+                        if not market_info or not hasattr(market_info, 'data') or len(market_info.data) == 0:
+                            raise ValueError(f"Market {contract_id} not found or no data returned")
+
+                        market = market_info.data[0]
+                        self.logger.log(f"Found market: {market.name}", "INFO")
+
+                        # NOTE: Disable embedded TP for now - Extended doesn't seem to honor it
+                        # TP will be set as a separate limit order after entry fills
+                        if False and HAS_SETTLEMENT_DATA and take_profit_price:
+                            self.logger.log(f"🎯 Using create_order_settlement_data to generate TP settlement @ {take_profit_price}", "INFO")
+
+                            # Create SettlementDataCtx with same nonce/expire_time/signer for all orders
+                            settlement_ctx = SettlementDataCtx(
+                                market=market,
+                                fees=DEFAULT_FEES,
+                                builder_fee=None,
+                                nonce=nonce,
+                                collateral_position_id=self.stark_account.vault,
+                                expire_time=expire_time,
+                                signer=self.stark_account.sign,
+                                public_key=self.stark_account.public_key,
+                                starknet_domain=self.stark_config.starknet_domain,
+                            )
+
+                            # Generate settlement for entry order
+                            entry_settlement_data = create_order_settlement_data(
+                                side=order_side,
+                                synthetic_amount=quantity,
+                                price=execution_price,
+                                ctx=settlement_ctx,
+                            )
+
+                            self.logger.log(f"✅ Entry settlement generated", "INFO")
+
+                            # Generate settlement for TP (opposite side)
+                            tp_side = OrderSide.SELL if order_side == OrderSide.BUY else OrderSide.BUY
+                            tp_settlement_data = create_order_settlement_data(
+                                side=tp_side,
+                                synthetic_amount=quantity,
+                                price=take_profit_price,
+                                ctx=settlement_ctx,
+                            )
+
+                            self.logger.log(f"✅ TP settlement generated for {tp_side.value} @ {take_profit_price}", "INFO")
+
+                            # Create TP trigger model with settlement
+                            tp_trigger = CreateOrderTpslTriggerModel(
+                                trigger_price=take_profit_price,
+                                trigger_price_type=OrderTriggerPriceType.LAST,
+                                price=take_profit_price,
+                                price_type=OrderPriceType.LIMIT,
+                                settlement=tp_settlement_data.settlement,
+                                debugging_amounts=tp_settlement_data.debugging_amounts,
+                            )
+
+                            # Create NewOrderModel with entry settlement, conditional trigger, and TP
+                            modified_order = NewOrderModel(
+                                id=f"cond-{nonce}",
+                                market=contract_id,
+                                type=OrderType.CONDITIONAL,
+                                side=order_side,
+                                qty=quantity,
+                                price=execution_price,
+                                time_in_force=TimeInForce.GTT,
+                                expiry_epoch_millis=expiry_millis,
+                                fee=fee_rate,
+                                nonce=Decimal(nonce),
+                                self_trade_protection_level=SelfTradeProtectionLevel.ACCOUNT,
+                                trigger=conditional_trigger,
+                                settlement=entry_settlement_data.settlement,
+                                take_profit=tp_trigger,
+                                debugging_amounts=entry_settlement_data.debugging_amounts,
+                            )
+
+                            self.logger.log(f"✅ Created conditional order with TP @ {take_profit_price}", "INFO")
+
+                        else:
+                            # Fallback to order without TP if settlement data not available
+                            if take_profit_price:
+                                self.logger.log(
+                                    f"⚠️ TP @ {take_profit_price} will be set as separate conditional order after entry fills "
+                                    f"(settlement data generation not available: HAS_SETTLEMENT_DATA={HAS_SETTLEMENT_DATA})",
+                                    "INFO"
+                                )
+
+                            # Use create_order_object to build order with settlement signature
+                            base_order = create_order_object(
+                                account=self.stark_account,
+                                market=market,
+                                side=order_side,
+                                amount_of_synthetic=quantity,
+                                price=execution_price,
+                                expire_time=expire_time,
+                                time_in_force=TimeInForce.GTT,
+                                reduce_only=False,
+                                post_only=True,  # Enable Post Only to ensure Maker execution
+                                starknet_domain=self.stark_config.starknet_domain,
+                            )
+
+                            self.logger.log(f"✅ Base order object created with settlement signature", "INFO")
+
+                            # Create modified copy with conditional trigger
+                            modified_order = base_order.model_copy(update={
+                                'type': OrderType.CONDITIONAL,
+                                'trigger': conditional_trigger
+                            })
+
+                            self.logger.log(f"✅ Created conditional order without TP", "INFO")
+
+                        # DEBUG: Print modified order JSON
+                        try:
+                            modified_json = modified_order.to_api_request_json(exclude_none=True)
+                            self.logger.log("=" * 60, "INFO")
+                            self.logger.log("=== Modified Order JSON (with settlement) ===", "INFO")
+                            self.logger.log(json.dumps(modified_json, default=str, indent=2), "INFO")
+                            self.logger.log("=" * 60, "INFO")
+                        except Exception as e:
+                            self.logger.log(f"Failed to serialize modified order: {e}", "ERROR")
+
+                        # Place the signed order
+                        order_result = await self.perpetual_trading_client.orders.place_order(order=modified_order)
+
+                    except Exception as e:
+                        self.logger.log(f"❌ create_order_object failed: {e}", "ERROR")
+                        self.logger.log(f"Exception type: {type(e).__name__}", "ERROR")
+                        self.logger.log(f"Full traceback: {traceback.format_exc()}", "ERROR")
+                        # Re-raise to stop execution - no fallback
+                        raise
+                else:
+                    self.logger.log("❌ create_order_object not available", "ERROR")
+                    raise ImportError("create_order_object not available - cannot place conditional orders")
+
+            except Exception as exc:
+                # No fallback - let the error propagate
+                self.logger.log(f"❌ Failed to place conditional order: {repr(exc)}", "ERROR")
+                raise
+
+            if not order_result or not order_result.data or order_result.status != 'OK':
+                error_msg = f'Failed to place conditional order: {order_result}'
+                self.logger.log(f"❌ {error_msg}", "ERROR")
+                return OrderResult(success=False, error_message=error_msg)
+
+            order_id = order_result.data.id
+            if not order_id:
+                return OrderResult(success=False, error_message='No order ID in response')
+
+            # Check order status
+            await asyncio.sleep(0.1)  # Give it a moment to register
+            order_info = await self.get_order_info(order_id)
+
+            if order_info and order_info.status in ['NEW', 'OPEN', 'UNTRIGGERED', 'PARTIALLY_FILLED', 'FILLED']:
+                self.logger.log(
+                    f"✅ Conditional order placed: {order_id} (status: {order_info.status}) @ trigger={trigger_price}" +
+                    (f", TP={take_profit_price}" if take_profit_price else ""),
+                    "INFO"
+                )
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=side,
+                    size=quantity,
+                    price=trigger_price,
+                    status=order_info.status,
+                    has_embedded_tp=False  # TP is disabled in this implementation (line 953), always place separately
+                )
+            else:
+                return OrderResult(success=False, error_message=f'Unexpected order status: {order_info.status if order_info else "unknown"}')
+
+        except Exception as e:
+            self.logger.log(f"Error placing conditional order: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
 
     

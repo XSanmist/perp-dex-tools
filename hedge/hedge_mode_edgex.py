@@ -1192,7 +1192,7 @@ class HedgeBot:
                 if time.time() - start_time2 > 180:
                     self.logger.error(f"❌ Timeout waiting for trade completion")
                     break
-            
+
             # Close remaining position
             self.logger.info(f"[STEP 3] EdgeX position: {self.edgex_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False

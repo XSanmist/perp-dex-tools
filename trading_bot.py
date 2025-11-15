@@ -305,19 +305,43 @@ class TradingBot:
                 else:
                     self.order_filled_amount = self.exchange_client.current_order.filled_size
             else:
+                cancel_result = None
+
+                async def fetch_and_record_order_fill():
+                    try:
+                        order_info_local = await self.exchange_client.get_order_info(order_id)
+                    except Exception as info_err:
+                        self.logger.log(f"[OPEN] [{order_id}] Failed to fetch order info after cancellation: {info_err}", "WARNING")
+                        return
+                    if order_info_local is not None:
+                        self.order_filled_amount = order_info_local.filled_size
+                        self.current_order_status = order_info_local.status
+                        if self.order_filled_amount > 0:
+                            self.logger.log(
+                                f"[OPEN] [{order_id}] Detected filled amount {self.order_filled_amount} after cancellation",
+                                "INFO"
+                            )
+
                 try:
                     cancel_result = await self.exchange_client.cancel_order(order_id)
                     if not cancel_result.success:
                         self.order_canceled_event.set()
-                        self.logger.log(f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.error_message}", "WARNING")
+                        error_message = cancel_result.error_message or ""
+                        self.logger.log(f"[CLOSE] Failed to cancel order {order_id}: {error_message}", "WARNING")
+                        if "ORDER_IS_CLOSED" in str(error_message).upper():
+                            await fetch_and_record_order_fill()
                     else:
                         self.current_order_status = "CANCELED"
+                        if getattr(cancel_result, "filled_size", None):
+                            self.order_filled_amount = cancel_result.filled_size
 
                 except Exception as e:
                     self.order_canceled_event.set()
                     self.logger.log(f"[CLOSE] Error canceling order {order_id}: {e}", "ERROR")
+                    if "ORDER_IS_CLOSED" in str(e).upper():
+                        await fetch_and_record_order_fill()
 
-                if self.config.exchange == "backpack" or self.config.exchange == "extended":
+                if self.config.exchange in ("backpack", "extended") and cancel_result and getattr(cancel_result, "filled_size", None):
                     self.order_filled_amount = cancel_result.filled_size
                 else:
                     # Wait for cancel event or timeout
@@ -326,7 +350,8 @@ class TradingBot:
                             await asyncio.wait_for(self.order_canceled_event.wait(), timeout=5)
                         except asyncio.TimeoutError:
                             order_info = await self.exchange_client.get_order_info(order_id)
-                            self.order_filled_amount = order_info.filled_size
+                            if order_info is not None:
+                                self.order_filled_amount = order_info.filled_size
 
             if self.order_filled_amount > 0:
                 close_side = self.config.close_order_side

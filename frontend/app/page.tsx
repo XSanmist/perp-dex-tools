@@ -1,11 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Pause, Square, RefreshCw, Terminal, Activity, Plus } from "lucide-react";
+import { Square, Terminal, Activity, Plus, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { NewTaskDialog } from "@/components/NewTaskDialog";
+import { ApiKeyDialog } from "@/components/ApiKeyDialog";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -40,15 +42,77 @@ export default function Home() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [loading, setLoading] = useState(true);
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
+  const [showApiKeyDialog, setShowApiKeyDialog] = useState(false);
   const [taskToStop, setTaskToStop] = useState<{ id: string; name: string } | null>(null);
+  const [error, setError] = useState<{ title: string; message: string } | null>(null);
   const [, setCurrentTime] = useState(Date.now()); // 用于触发运行时间的更新
   const logsEndRef = useRef<HTMLDivElement>(null);
   const logIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  // 获取 API Key
+  const getApiKey = () => {
+    return localStorage.getItem('apiKey') || '';
+  };
+
+  // 创建请求头
+  const getHeaders = () => {
+    const headers: HeadersInit = {
+      'Content-Type': 'application/json',
+    };
+    const apiKey = getApiKey();
+    if (apiKey) {
+      headers['X-API-Key'] = apiKey;
+    }
+    return headers;
+  };
+
+  // 处理 API 错误
+  // useToast: true = 使用 toast 提示（后台API），false = 使用弹窗提示（用户操作）
+  const handleApiError = async (response: Response, defaultMessage: string, useToast: boolean = false) => {
+    let title = '';
+    let message = '';
+
+    if (response.status === 403) {
+      title = 'Authentication Error';
+      message = 'Invalid or missing API key. Please configure your API key in Settings.';
+    } else if (response.status === 500) {
+      try {
+        const errorData = await response.json();
+        title = 'Server Configuration Error';
+        message = errorData.detail || 'Server configuration error. Please contact administrator.';
+      } catch {
+        title = 'Server Error';
+        message = 'Internal server error. Please try again later.';
+      }
+    } else {
+      // 其他错误
+      try {
+        const errorData = await response.json();
+        title = 'Request Failed';
+        message = errorData.detail || defaultMessage;
+      } catch {
+        title = 'Request Failed';
+        message = defaultMessage;
+      }
+    }
+
+    // 根据参数选择提示方式
+    if (useToast) {
+      toast.error(title, {
+        description: message,
+        duration: 5000,
+      });
+    } else {
+      setError({ title, message });
+    }
+  };
+
   // 获取任务列表
   const fetchProcesses = async () => {
     try {
-      const response = await fetch('http://localhost:8000/processes');
+      const response = await fetch('http://localhost:8000/processes', {
+        headers: getHeaders(),
+      });
       if (response.ok) {
         const data = await response.json();
         // 将对象转换为数组
@@ -87,8 +151,14 @@ export default function Home() {
         if (processList.length > 0 && !selectedTask) {
           setSelectedTask(processList[0].pid);
         }
+      } else {
+        await handleApiError(response, 'Failed to fetch task list', true);
       }
     } catch (error) {
+      toast.error('Network Error', {
+        description: 'Failed to connect to the server. Please check if the backend is running.',
+        duration: 5000,
+      });
       console.error('Failed to fetch processes:', error);
     } finally {
       setLoading(false);
@@ -123,7 +193,8 @@ export default function Home() {
   const stopTask = async (taskId: string) => {
     try {
       const response = await fetch(`http://localhost:8000/processes/${taskId}/stop`, {
-        method: 'POST'
+        method: 'POST',
+        headers: getHeaders(),
       });
 
       if (response.ok) {
@@ -138,10 +209,13 @@ export default function Home() {
           setLogs([]);
         }
       } else {
-        const error = await response.text();
-        console.error('Failed to stop task:', error);
+        await handleApiError(response, 'Failed to stop task', false);
       }
     } catch (error) {
+      setError({
+        title: 'Network Error',
+        message: 'Failed to connect to the server. Please check if the backend is running.'
+      });
       console.error('Failed to stop task:', error);
     } finally {
       setTaskToStop(null);
@@ -189,9 +263,7 @@ export default function Home() {
 
       const response = await fetch(`http://localhost:8000${endpoint}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: getHeaders(),
         body: JSON.stringify(body)
       });
 
@@ -199,10 +271,16 @@ export default function Home() {
         // 刷新任务列表
         await fetchProcesses();
       } else {
-        const error = await response.text();
-        throw new Error(error);
+        await handleApiError(response, 'Failed to create task', false);
+        throw new Error('Failed to create task');
       }
     } catch (error) {
+      if (error instanceof TypeError) {
+        setError({
+          title: 'Network Error',
+          message: 'Failed to connect to the server. Please check if the backend is running.'
+        });
+      }
       console.error('Failed to create task:', error);
       throw error;
     }
@@ -214,6 +292,7 @@ export default function Home() {
     // 每5秒刷新任务列表
     const interval = setInterval(fetchProcesses, 5000);
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 每秒更新运行时间显示
@@ -246,6 +325,7 @@ export default function Home() {
         clearInterval(logIntervalRef.current);
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTask, tasks]);
 
   // Auto-scroll to bottom when new logs arrive
@@ -304,12 +384,21 @@ export default function Home() {
         {/* Header */}
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-3xl font-bold text-white">Task Monitor</h1>
-          <Button
-            onClick={() => setShowNewTaskModal(true)}
-          >
-            <Plus className="w-4 h-4 mr-2" />
-            New Task
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setShowApiKeyDialog(true)}
+            >
+              <Settings className="w-4 h-4 mr-2" />
+              Settings
+            </Button>
+            <Button
+              onClick={() => setShowNewTaskModal(true)}
+            >
+              <Plus className="w-4 h-4 mr-2" />
+              New Task
+            </Button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -387,39 +476,18 @@ export default function Home() {
                           )}
                         </div>
 
-                        <div className="flex gap-2 mt-3">
+                        <div className="mt-3">
                           <Button
                             size="sm"
-                            variant="outline"
-                            className="flex-1"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              // Handle pause/resume
-                            }}
-                          >
-                            <Pause className="w-3 h-3" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="flex-1"
+                            variant="destructive"
+                            className="w-full"
                             onClick={(e) => {
                               e.stopPropagation();
                               setTaskToStop({ id: task.id, name: task.name });
                             }}
                           >
-                            <Square className="w-3 h-3" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="flex-1"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              // Handle restart
-                            }}
-                          >
-                            <RefreshCw className="w-3 h-3" />
+                            <Square className="w-3 h-3 mr-2" />
+                            Stop Task
                           </Button>
                         </div>
                       </CardContent>
@@ -576,6 +644,12 @@ export default function Home() {
         onCreateTask={createNewTask}
       />
 
+      {/* API Key Settings Dialog */}
+      <ApiKeyDialog
+        open={showApiKeyDialog}
+        onOpenChange={setShowApiKeyDialog}
+      />
+
       {/* Stop Task Confirmation Dialog */}
       <AlertDialog open={!!taskToStop} onOpenChange={(open) => !open && setTaskToStop(null)}>
         <AlertDialogContent>
@@ -593,6 +667,33 @@ export default function Home() {
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               Stop Task
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Error Dialog */}
+      <AlertDialog open={!!error} onOpenChange={(open) => !open && setError(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-destructive">{error?.title}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {error?.message}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            {error?.title === 'Authentication Error' && (
+              <AlertDialogAction
+                onClick={() => {
+                  setError(null);
+                  setShowApiKeyDialog(true);
+                }}
+              >
+                Open Settings
+              </AlertDialogAction>
+            )}
+            <AlertDialogAction onClick={() => setError(null)}>
+              OK
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

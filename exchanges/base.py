@@ -43,6 +43,7 @@ class OrderResult:
     status: Optional[str] = None
     error_message: Optional[str] = None
     filled_size: Optional[Decimal] = None
+    has_embedded_tp: bool = False  # True if order includes embedded TP
 
 
 @dataclass

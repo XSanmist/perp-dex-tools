@@ -23,6 +23,7 @@ Cross-platform compatibility:
 import asyncio
 import sys
 import argparse
+import os
 from decimal import Decimal
 from pathlib import Path
 import dotenv
@@ -119,15 +120,19 @@ async def main():
     print("-" * 50)
     
     try:
+        # Get task ID from environment (set by API server)
+        task_id = os.getenv('TASK_ID', '')
+
         # Create the hedge bot instance
         bot = HedgeBotClass(
             ticker=args.ticker.upper(),
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             iterations=args.iter,
-            sleep_time=args.sleep
+            sleep_time=args.sleep,
+            task_id=task_id
         )
-        
+
         # Run the bot
         await bot.run()
         

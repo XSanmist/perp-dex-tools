@@ -5,6 +5,7 @@ Simplified Paradex exchange client implementation - L2 credentials only.
 import os
 import asyncio
 import time
+import contextlib
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Tuple
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
@@ -107,6 +108,15 @@ class ParadexClient(BaseExchangeClient):
         self._order_update_handler = None
         self.order_size_increment = ''
 
+        # WebSocket health monitoring state
+        self._ws_connected = False
+        self._ws_last_message_time = time.time()
+        self._ws_health_task = None
+        self._ws_health_stop = None
+        self._ws_reconnect_lock = asyncio.Lock()
+        self._ws_health_interval = 30  # seconds
+        self._ws_health_timeout = 120  # seconds without messages triggers reconnect
+
     def _initialize_paradex_client(self) -> None:
         """Initialize the Paradex client with L2 credentials only."""
         try:
@@ -151,10 +161,20 @@ class ParadexClient(BaseExchangeClient):
 
         # Setup WebSocket subscription for order updates if handler is set
         await self._setup_websocket_subscription()
+        self._ws_last_message_time = time.time()
+        self._start_ws_health_monitor()
 
     async def disconnect(self) -> None:
         """Disconnect from Paradex."""
         try:
+            if self._ws_health_stop:
+                self._ws_health_stop.set()
+            if self._ws_health_task:
+                self._ws_health_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._ws_health_task
+                self._ws_health_task = None
+
             if hasattr(self, 'paradex') and self.paradex:
                 await self.paradex.ws_client._close_connection()
                 self._ws_connected = False
@@ -175,6 +195,9 @@ class ParadexClient(BaseExchangeClient):
 
             params = message.get("params", {})
             data = params.get("data", {})
+
+            # Record heartbeat timestamp
+            self._ws_last_message_time = time.time()
 
             if ws_channel == ParadexWebsocketChannel.ORDERS:
                 # Extract order data
@@ -253,6 +276,62 @@ class ParadexClient(BaseExchangeClient):
             self.logger.log(f"Subscribed to order updates for {contract_id}", "INFO")
         except Exception as e:
             self.logger.log(f"Failed to subscribe to order updates: {e}", "ERROR")
+        else:
+            self._ws_last_message_time = time.time()
+
+    def _start_ws_health_monitor(self) -> None:
+        """Start websocket health monitoring loop."""
+        if self._ws_health_task and not self._ws_health_task.done():
+            return
+        if self._ws_health_stop is None:
+            self._ws_health_stop = asyncio.Event()
+        elif self._ws_health_stop.is_set():
+            self._ws_health_stop.clear()
+        self._ws_health_task = asyncio.create_task(self._ws_health_loop())
+
+    async def _ws_health_loop(self) -> None:
+        """Monitor websocket heartbeat and trigger reconnect if needed."""
+        try:
+            stop_event = self._ws_health_stop
+            while stop_event and not stop_event.is_set():
+                await asyncio.sleep(self._ws_health_interval)
+                if stop_event.is_set():
+                    break
+                elapsed = time.time() - self._ws_last_message_time
+                if elapsed > self._ws_health_timeout:
+                    self.logger.log("WebSocket heartbeat timeout, attempting reconnect", "WARNING")
+                    await self._restart_websocket()
+        except asyncio.CancelledError:
+            pass
+
+    async def _restart_websocket(self) -> None:
+        """Reconnect websocket and resubscribe to channels."""
+        if self._ws_reconnect_lock.locked():
+            return
+        async with self._ws_reconnect_lock:
+            try:
+                await self.paradex.ws_client._close_connection()
+            except Exception as e:
+                self.logger.log(f"Error during Paradex WS close: {e}", "ERROR")
+
+            self._ws_connected = False
+            await asyncio.sleep(1)
+
+            is_connected = False
+            while not is_connected:
+                try:
+                    is_connected = await self.paradex.ws_client.connect()
+                except Exception as e:
+                    self.logger.log(f"WebSocket reconnect failed: {e}", "ERROR")
+                    is_connected = False
+
+                if not is_connected:
+                    await asyncio.sleep(1)
+
+            self._ws_connected = True
+            await self._setup_websocket_subscription()
+            self._ws_last_message_time = time.time()
+            self.logger.log("WebSocket reconnected and resubscribed", "INFO")
 
     @retry(
         stop=stop_after_attempt(5),

@@ -87,7 +87,7 @@ export function NewTaskDialog({ open, onOpenChange, onCreateTask }: NewTaskDialo
         <DialogHeader>
           <DialogTitle>Create New Trading Task</DialogTitle>
           <DialogDescription>
-            Configure your trading bot parameters. Click create when you're done.
+            Configure your trading bot parameters. Click create when you&apos;re done.
           </DialogDescription>
         </DialogHeader>
 

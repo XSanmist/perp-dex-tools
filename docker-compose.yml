@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  # 后端 API 服务（FastAPI）
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: perp-dex-backend
+    restart: unless-stopped
+
+    # 环境变量（从 .env 文件加载）
+    env_file:
+      - .env
+
+    # 数据卷挂载
+    volumes:
+      # 日志目录映射到主机（可查看实时日志）
+      - ./logs:/app/logs
+      # .env 文件挂载（脚本需要读取此文件）
+      - ./.env:/app/.env:ro
+      # 可选：如果需要热更新代码（开发模式）
+      # - .:/app
+
+    # API 服务端口映射
+    ports:
+      - "8000:8000"
+
+    # 默认使用 uvicorn 启动 API 服务
+    # 通过 API 可以调用 runbot.py 和 hedge_mode.py
+    # command 已在 Dockerfile 中定义，无需在此重复
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # 前端服务（Next.js）
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: perp-dex-frontend
+    restart: unless-stopped
+    # 默认启动（没有 profiles）
+
+    # 环境变量
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+
+    # 前端端口映射
+    ports:
+      - "3000:3000"
+
+    # 依赖后端服务
+    depends_on:
+      - backend
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

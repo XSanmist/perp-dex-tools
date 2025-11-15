@@ -1,0 +1,44 @@
+version: '3.8'
+
+# 这个文件用于只启动后端服务
+# 使用方式: docker-compose -f docker-compose.backend.yml up -d --build
+
+services:
+  # 后端 API 服务（FastAPI）
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: perp-dex-backend
+    restart: unless-stopped
+
+    # 环境变量（从 .env 文件加载）
+    env_file:
+      - .env
+
+    # 数据卷挂载
+    volumes:
+      # 日志目录映射到主机（可查看实时日志）
+      - ./logs:/app/logs
+      # .env 文件挂载（脚本需要读取此文件）
+      - ./.env:/app/.env:ro
+
+    # API 服务端口映射
+    ports:
+      - "8000:8000"
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
