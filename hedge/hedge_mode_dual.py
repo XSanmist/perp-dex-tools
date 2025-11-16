@@ -409,7 +409,8 @@ class DualExchangeHedge:
                             exchange_client=self.secondary_client,
                             contract_id=self.secondary_contract_id,
                             quantity=quantity,
-                            side=hedge_side
+                            side=hedge_side,
+                            price_offset=Decimal('0.005')  # 0.5% 偏移，确保立即成交
                         )
 
                         if result.success:

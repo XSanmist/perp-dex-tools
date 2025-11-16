@@ -441,7 +441,7 @@ export default function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-background p-6">
+    <div className="min-h-screen bg-background px-6 pt-6 pb-0">
       <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="flex justify-between items-center mb-8">
@@ -562,9 +562,9 @@ export default function Home() {
           </div>
 
           {/* Right Column */}
-          <div className="lg:col-span-2">
+          <div className="lg:col-span-2 flex flex-col" style={{ height: 'calc(100vh - 8rem)' }}>
             {/* Stats Cards */}
-            <div className="grid grid-cols-3 gap-4 mb-6">
+            <div className="grid grid-cols-3 gap-4 mb-6 flex-shrink-0">
               <Card className="bg-card border-gray-800">
                 <CardContent className="p-4">
                   <div className="text-sm text-gray-400 mb-1">Runtime</div>
@@ -655,7 +655,7 @@ export default function Home() {
               const task = tasks.find(t => t.pid === selectedTask);
               if (task && (task.primary_rtt_ms !== undefined || task.secondary_rtt_ms !== undefined)) {
                 return (
-                  <div className="grid grid-cols-2 gap-4 mb-6">
+                  <div className="grid grid-cols-2 gap-4 mb-6 flex-shrink-0">
                     {task.primary_rtt_ms !== undefined && task.primary_rtt_ms !== null && (
                       <Card className="bg-card border-gray-800">
                         <CardContent className="p-4">
@@ -685,7 +685,7 @@ export default function Home() {
             })()}
 
             {/* Log Viewer */}
-            <Card className="bg-card border-gray-800 h-[600px] flex flex-col">
+            <Card className="bg-card border-gray-800 flex-1 flex flex-col min-h-0">
               <CardHeader className="flex-shrink-0">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
