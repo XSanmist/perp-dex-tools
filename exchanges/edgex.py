@@ -508,7 +508,7 @@ class EdgeXClient(BaseExchangeClient):
 
         return contract_orders
 
-    @query_retry(default_return=0)
+    @query_retry(default_return=None)
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
         positions_data = await self.client.get_account_positions()

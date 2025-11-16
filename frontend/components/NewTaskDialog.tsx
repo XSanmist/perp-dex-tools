@@ -28,6 +28,7 @@ interface NewTaskDialogProps {
 
 export function NewTaskDialog({ open, onOpenChange, onCreateTask }: NewTaskDialogProps) {
   const [taskType, setTaskType] = useState<'runbot' | 'hedge' | 'momentum'>('hedge');
+  const [hedgeMode, setHedgeMode] = useState<'classic' | 'dual'>('dual'); // 默认选择 dual 模式
   const [formData, setFormData] = useState({
     exchange: 'extended',
     ticker: 'ETH',
@@ -35,11 +36,14 @@ export function NewTaskDialog({ open, onOpenChange, onCreateTask }: NewTaskDialo
     direction: 'buy',
     quantity: '0.1',
     boost: false,
-    // Hedge Mode fields
-    size: '0.03',
+    // Hedge Mode fields (Classic)
+    size: '0.01',  // 改为 0.01
     iterations: '100',
     sleep: '3',
     fillTimeout: '5',
+    // Hedge Mode fields (Dual Exchange)
+    primaryExchange: 'grvt',      // 主交易所默认 grvt
+    secondaryExchange: 'extended', // 副交易所默认 extended
     // Momentum Bot fields (simplified - no manual prices)
     tickOffset: '1',
     takeProfitPct: '0.02',
@@ -53,6 +57,7 @@ export function NewTaskDialog({ open, onOpenChange, onCreateTask }: NewTaskDialo
     try {
       const taskData = {
         type: taskType,
+        hedgeMode: taskType === 'hedge' ? hedgeMode : undefined,
         ...formData,
       };
       await onCreateTask(taskData);
@@ -64,16 +69,19 @@ export function NewTaskDialog({ open, onOpenChange, onCreateTask }: NewTaskDialo
         direction: 'buy',
         quantity: '0.1',
         boost: false,
-        size: '0.03',
+        size: '0.01',  // 改为 0.01
         iterations: '100',
         sleep: '3',
         fillTimeout: '5',
+        primaryExchange: 'grvt',      // 主交易所默认 grvt
+        secondaryExchange: 'extended', // 副交易所默认 extended
         tickOffset: '1',
         takeProfitPct: '0.02',
         maxPositions: '1',
         waitTime: '5',
       });
       setTaskType('hedge');
+      setHedgeMode('dual');  // 默认选择 dual 模式
     } catch (error) {
       console.error('Failed to create task:', error);
     } finally {
@@ -107,22 +115,107 @@ export function NewTaskDialog({ open, onOpenChange, onCreateTask }: NewTaskDialo
             </Select>
           </div>
 
-          {/* Exchange */}
-          <div className="grid gap-3">
-            <Label htmlFor="exchange">Exchange</Label>
-            <Select
-              value={formData.exchange}
-              onValueChange={(value) => setFormData({ ...formData, exchange: value })}
-            >
-              <SelectTrigger id="exchange">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="backpack">Backpack</SelectItem>
-                <SelectItem value="extended">Extended</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {/* Hedge Mode Selection (only for hedge task type) */}
+          {taskType === 'hedge' && (
+            <div className="grid gap-3">
+              <Label htmlFor="hedgeMode">Hedge Mode</Label>
+              <Select value={hedgeMode} onValueChange={(value: 'classic' | 'dual') => setHedgeMode(value)}>
+                <SelectTrigger id="hedgeMode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="classic">Classic (Exchange ↔ Lighter)</SelectItem>
+                  <SelectItem value="dual">Dual Exchange (任意两个交易所)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {/* Exchange Selection - varies by task type and hedge mode */}
+          {taskType === 'hedge' && hedgeMode === 'classic' ? (
+            <div className="grid gap-3">
+              <Label htmlFor="exchange">Exchange (will hedge with Lighter)</Label>
+              <Select
+                value={formData.exchange}
+                onValueChange={(value) => setFormData({ ...formData, exchange: value })}
+              >
+                <SelectTrigger id="exchange">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="backpack">Backpack</SelectItem>
+                  <SelectItem value="extended">Extended</SelectItem>
+                  <SelectItem value="paradex">Paradex</SelectItem>
+                  <SelectItem value="aster">Aster</SelectItem>
+                  <SelectItem value="edgex">EdgeX</SelectItem>
+                  <SelectItem value="apex">Apex</SelectItem>
+                  <SelectItem value="grvt">GRVT</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          ) : taskType === 'hedge' && hedgeMode === 'dual' ? (
+            <>
+              <div className="grid gap-3">
+                <Label htmlFor="primaryExchange">Primary Exchange (主交易所 - Post-Only)</Label>
+                <Select
+                  value={formData.primaryExchange}
+                  onValueChange={(value) => setFormData({ ...formData, primaryExchange: value })}
+                >
+                  <SelectTrigger id="primaryExchange">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="backpack">Backpack</SelectItem>
+                    <SelectItem value="extended">Extended</SelectItem>
+                    <SelectItem value="paradex">Paradex</SelectItem>
+                    <SelectItem value="aster">Aster</SelectItem>
+                    <SelectItem value="edgex">EdgeX</SelectItem>
+                    <SelectItem value="apex">Apex</SelectItem>
+                    <SelectItem value="grvt">GRVT</SelectItem>
+                    <SelectItem value="lighter">Lighter</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="grid gap-3">
+                <Label htmlFor="secondaryExchange">Secondary Exchange (副交易所 - Hedge)</Label>
+                <Select
+                  value={formData.secondaryExchange}
+                  onValueChange={(value) => setFormData({ ...formData, secondaryExchange: value })}
+                >
+                  <SelectTrigger id="secondaryExchange">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="backpack">Backpack</SelectItem>
+                    <SelectItem value="extended">Extended</SelectItem>
+                    <SelectItem value="paradex">Paradex</SelectItem>
+                    <SelectItem value="aster">Aster</SelectItem>
+                    <SelectItem value="edgex">EdgeX</SelectItem>
+                    <SelectItem value="apex">Apex</SelectItem>
+                    <SelectItem value="grvt">GRVT</SelectItem>
+                    <SelectItem value="lighter">Lighter</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </>
+          ) : (
+            <div className="grid gap-3">
+              <Label htmlFor="exchange">Exchange</Label>
+              <Select
+                value={formData.exchange}
+                onValueChange={(value) => setFormData({ ...formData, exchange: value })}
+              >
+                <SelectTrigger id="exchange">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="backpack">Backpack</SelectItem>
+                  <SelectItem value="extended">Extended</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
 
           {/* Ticker */}
           <div className="grid gap-3">

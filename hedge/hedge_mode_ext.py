@@ -243,8 +243,10 @@ class HedgeBot:
         status_data[self.task_id] = {
             'current_iteration': self.current_iteration,
             'total_iterations': self.iterations,
-            'extended_position': float(self.extended_position),
-            'lighter_position': float(self.lighter_position),
+            'primary_position': float(self.extended_position),
+            'secondary_position': float(self.lighter_position),
+            'primary_exchange': self.exchange_name,
+            'secondary_exchange': 'lighter',
             'runtime_seconds': runtime_seconds
         }
 

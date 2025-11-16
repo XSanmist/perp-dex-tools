@@ -8,6 +8,7 @@ import subprocess
 import os
 import re
 import json
+import logging
 from datetime import datetime
 from typing import Optional, Dict, Any
 from enum import Enum
@@ -22,6 +23,13 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 # ==================== API Key Authentication ====================
@@ -94,12 +102,26 @@ class RunBotRequest(BaseModel):
 
 
 class HedgeModeRequest(BaseModel):
-    exchange: ExchangeType = Field(..., description="Exchange to trade on (backpack or extended)")
+    # 对冲模式选择
+    hedgeMode: Optional[str] = Field("classic", description="Hedge mode: 'classic' (with Lighter) or 'dual' (any two exchanges)")
+
+    # Classic mode (老模式) - 与 Lighter 对冲
+    exchange: Optional[str] = Field(None, description="Exchange to trade on (for classic mode)")
+
+    # Dual mode (新模式) - 任意两个交易所对冲
+    primaryExchange: Optional[str] = Field(None, description="Primary exchange (post-only orders)")
+    secondaryExchange: Optional[str] = Field(None, description="Secondary exchange (hedge orders)")
+
+    # 通用参数
     ticker: str = Field(..., description="Trading pair ticker (e.g., ETH, BTC)")
     size: float = Field(..., gt=0, description="Order size per iteration")
     iterations: int = Field(..., alias="iter", gt=0, description="Number of iterations to run")
-    sleep: int = Field(0, ge=0, description="Sleep time in seconds after each step")
-    fill_timeout: int = Field(5, ge=1, description="Timeout in seconds for maker order fills")
+    sleep: int = Field(0, ge=0, description="Sleep time in seconds after each step (classic mode) or wait time after opening position (dual mode)")
+    fill_timeout: int = Field(5, ge=1, description="Timeout in seconds for maker order fills (classic mode) or order timeout (dual mode)")
+
+    # Dual mode 专用参数
+    position_check_interval: int = Field(5, ge=1, description="Position check interval in seconds (dual mode)")
+    balance_check_retries: int = Field(3, ge=1, description="Number of retries for balance check (dual mode)")
 
 
 class MomentumBotRequest(BaseModel):
@@ -125,8 +147,12 @@ class ProcessInfo(BaseModel):
     start_time: str
     current_iteration: Optional[int] = None
     total_iterations: Optional[int] = None
-    extended_position: Optional[float] = None
-    lighter_position: Optional[float] = None
+    # Position information
+    primary_position: Optional[float] = None
+    secondary_position: Optional[float] = None
+    # Exchange names
+    primary_exchange: Optional[str] = None
+    secondary_exchange: Optional[str] = None
     runtime_seconds: Optional[int] = None
 
 
@@ -247,12 +273,17 @@ async def run_bot(request: RunBotRequest, api_key: str = Depends(verify_api_key)
 @app.post("/hedge", response_model=BotStatus)
 async def run_hedge_mode(request: HedgeModeRequest, api_key: str = Depends(verify_api_key)):
     """
-    Run hedge mode trading using hedge_mode.py
+    Run hedge mode trading
 
-    Example:
+    Supports two modes:
+    1. Classic mode: hedge_mode.py (Exchange ↔ Lighter)
+    2. Dual mode: hedge_mode_dual.py (任意两个交易所)
+
+    Example (Classic):
     ```
     POST /hedge
     {
+        "hedgeMode": "classic",
         "exchange": "extended",
         "ticker": "ETH",
         "size": 0.1,
@@ -261,29 +292,91 @@ async def run_hedge_mode(request: HedgeModeRequest, api_key: str = Depends(verif
         "fill_timeout": 5
     }
     ```
+
+    Example (Dual):
+    ```
+    POST /hedge
+    {
+        "hedgeMode": "dual",
+        "primaryExchange": "backpack",
+        "secondaryExchange": "paradex",
+        "ticker": "SOL-PERP",
+        "size": 0.1,
+        "iter": 20,
+        "sleep": 10,
+        "fill_timeout": 30,
+        "position_check_interval": 5,
+        "balance_check_retries": 3
+    }
+    ```
     """
-    # Build command
-    command = [
-        "python3", "hedge_mode.py",
-        "--exchange", request.exchange.value,
-        "--ticker", request.ticker,
-        "--size", str(request.size),
-        "--iter", str(request.iterations),
-        "--sleep", str(request.sleep),
-        "--fill-timeout", str(request.fill_timeout)
-    ]
+    hedge_mode = request.hedgeMode or "classic"
 
-    # Generate task ID
-    task_id = f"hedge_{request.exchange.value}_{request.ticker}_{get_current_timestamp()}"
+    if hedge_mode == "dual":
+        # 新模式：任意两个交易所对冲
+        if not request.primaryExchange or not request.secondaryExchange:
+            raise HTTPException(
+                status_code=400,
+                detail="primaryExchange and secondaryExchange are required for dual mode"
+            )
 
-    # Run in background
-    run_command_background(command, task_id)
+        # Generate task ID
+        task_id = f"hedge_dual_{request.primaryExchange}_{request.secondaryExchange}_{request.ticker}_{get_current_timestamp()}"
 
-    return BotStatus(
-        status="started",
-        message=f"Hedge mode task started: {' '.join(command)}",
-        timestamp=get_current_timestamp()
-    )
+        # Build command for run_hedge_dual.py
+        command = [
+            "python3", "run_hedge_dual.py",
+            "--primary", request.primaryExchange,
+            "--secondary", request.secondaryExchange,
+            "--ticker", request.ticker,
+            "--size", str(request.size),
+            "--iter", str(request.iterations),
+            "--order-timeout", str(request.fill_timeout),
+            "--position-check-interval", str(request.position_check_interval),
+            "--wait-after-open", str(request.sleep),
+            "--balance-check-retries", str(request.balance_check_retries),
+            "--task-id", task_id
+        ]
+
+        # Run in background
+        run_command_background(command, task_id)
+
+        return BotStatus(
+            status="started",
+            message=f"Dual exchange hedge mode task started: {request.primaryExchange} ↔ {request.secondaryExchange}",
+            timestamp=get_current_timestamp()
+        )
+
+    else:
+        # 经典模式：Exchange ↔ Lighter
+        if not request.exchange:
+            raise HTTPException(
+                status_code=400,
+                detail="exchange is required for classic mode"
+            )
+
+        # Build command for hedge_mode.py
+        command = [
+            "python3", "hedge_mode.py",
+            "--exchange", request.exchange,
+            "--ticker", request.ticker,
+            "--size", str(request.size),
+            "--iter", str(request.iterations),
+            "--sleep", str(request.sleep),
+            "--fill-timeout", str(request.fill_timeout)
+        ]
+
+        # Generate task ID
+        task_id = f"hedge_classic_{request.exchange}_{request.ticker}_{get_current_timestamp()}"
+
+        # Run in background
+        run_command_background(command, task_id)
+
+        return BotStatus(
+            status="started",
+            message=f"Classic hedge mode task started: {' '.join(command)}",
+            timestamp=get_current_timestamp()
+        )
 
 
 @app.post("/momentum", response_model=BotStatus)
@@ -359,9 +452,13 @@ async def list_processes(api_key: str = Depends(verify_api_key)):
             status = status_data[task_id]
             info_dict['current_iteration'] = status.get('current_iteration')
             info_dict['total_iterations'] = status.get('total_iterations')
-            info_dict['extended_position'] = status.get('extended_position')
-            info_dict['lighter_position'] = status.get('lighter_position')
             info_dict['runtime_seconds'] = status.get('runtime_seconds')
+
+            # Position information
+            info_dict['primary_position'] = status.get('primary_position')
+            info_dict['secondary_position'] = status.get('secondary_position')
+            info_dict['primary_exchange'] = status.get('primary_exchange')
+            info_dict['secondary_exchange'] = status.get('secondary_exchange')
 
         result[task_id] = ProcessInfo(**info_dict)
 
@@ -561,57 +658,177 @@ async def stream_logs(
     )
 
 
-@app.websocket("/ws/logs/{exchange}/{ticker}")
-async def websocket_logs(websocket: WebSocket, exchange: str, ticker: str):
+@app.websocket("/ws/logs/{task_id}")
+async def websocket_logs(websocket: WebSocket, task_id: str):
     """
-    WebSocket endpoint for real-time log streaming
-
-    Usage with websocat:
-    ```bash
-    websocat ws://localhost:8000/ws/logs/extended/ETH
-    ```
+    WebSocket endpoint for real-time log streaming by task ID
 
     Usage with JavaScript:
     ```javascript
-    const ws = new WebSocket('ws://localhost:8000/ws/logs/extended/ETH');
+    const ws = new WebSocket('ws://localhost:8000/ws/logs/hedge_1234567890');
     ws.onmessage = (event) => {
         console.log(event.data);
     };
     ```
     """
-    await websocket.accept()
+    try:
+        await websocket.accept()
+        logger.info(f"[WebSocket] New connection for task: {task_id}")
+    except Exception as e:
+        logger.error(f"[WebSocket] Failed to accept connection: {e}", exc_info=True)
+        return
 
-    log_file = f"logs/{exchange}_{ticker}_hedge_mode_log.txt"
+    # URL解码 task_id（处理 %3A 等编码字符）
+    from urllib.parse import unquote
+    task_id = unquote(task_id)
+    logger.info(f"[WebSocket] Decoded task_id: {task_id}")
 
-    if not os.path.exists(log_file):
-        await websocket.send_text(f"Error: Log file not found: {log_file}")
+    # 查找日志文件
+    log_file = None
+
+    try:
+        # 尝试不同的日志文件命名模式
+        if task_id.startswith('hedge_dual_'):
+            # Dual hedge mode: hedge_dual_{primary}_{secondary}_{ticker}_{timestamp}
+            # 日志文件: logs/hedge_dual_{primary}_{secondary}_{ticker}.log
+            parts = task_id.split('_')
+            if len(parts) >= 5:  # hedge_dual_{primary}_{secondary}_{ticker}_{timestamp}
+                # 去掉 timestamp 部分
+                log_pattern = '_'.join(parts[:-1]) + '.log'
+                log_file = f"logs/{log_pattern}"
+        elif task_id.startswith('hedge_'):
+            # Classic hedge mode: hedge_{exchange}_{ticker}_{timestamp}
+            # 日志文件: logs/{exchange}_{ticker}_hedge_mode_log.txt
+            parts = task_id.split('_')
+            if len(parts) >= 3:
+                exchange = parts[1]
+                ticker = parts[2]
+                log_file = f"logs/{exchange}_{ticker}_hedge_mode_log.txt"
+        elif task_id.startswith('runbot_'):
+            # Runbot mode: runbot_{exchange}_{ticker}_{timestamp}
+            # 日志文件: logs/{exchange}_{ticker}_{timestamp}.log
+            parts = task_id.split('_')
+            if len(parts) >= 4:
+                log_pattern = '_'.join(parts[1:]) + '.log'
+                log_file = f"logs/{log_pattern}"
+
+        if not log_file or not os.path.exists(log_file):
+            # 如果找不到特定的日志文件，尝试在 logs 目录下查找最匹配的
+            import glob
+            logger.warning(f"[WebSocket] Log file not found at expected path: {log_file}")
+
+            possible_files = glob.glob(f"logs/*{task_id.split('_')[1] if len(task_id.split('_')) > 1 else task_id}*.log") + \
+                            glob.glob(f"logs/*{task_id.split('_')[1] if len(task_id.split('_')) > 1 else task_id}*.txt")
+
+            if possible_files:
+                # 使用最新的日志文件
+                log_file = max(possible_files, key=os.path.getctime)
+                logger.info(f"[WebSocket] Found alternative log file: {log_file}")
+            else:
+                error_msg = f"Error: Log file not found for task {task_id}"
+                logger.error(f"[WebSocket] {error_msg}")
+                await websocket.send_text(error_msg)
+                await websocket.close()
+                return
+        else:
+            logger.info(f"[WebSocket] Found log file: {log_file}")
+    except Exception as e:
+        error_msg = f"Error finding log file: {str(e)}"
+        logger.error(f"[WebSocket] {error_msg}", exc_info=True)
+        await websocket.send_text(error_msg)
         await websocket.close()
         return
 
     try:
-        # Send existing content first
-        with open(log_file, 'r') as f:
-            for line in f:
-                await websocket.send_text(line.rstrip('\n'))
+        # 只发送最近的 N 行历史日志（避免发送过多数据导致前端卡顿）
+        max_history_lines = 500  # 只发送最后 500 行
 
-        # Then follow new lines
-        with open(log_file, 'r') as f:
-            # Seek to end
-            f.seek(0, 2)
+        # 先获取当前文件大小
+        initial_size = os.path.getsize(log_file)
+        logger.info(f"[WebSocket] Starting log stream for {log_file}, size={initial_size} bytes")
 
-            while True:
-                line = f.readline()
-                if line:
+        # 使用更高效的方式读取最后 N 行（避免大文件导致内存问题）
+        sent_count = 0
+        total_lines = 0
+
+        try:
+            # 使用 deque 只保留最后 N 行，避免读取整个文件到内存
+            from collections import deque
+
+            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                # 只保留最后 N 行
+                last_lines = deque(f, maxlen=max_history_lines)
+
+                # 发送最后 N 行
+                for line in last_lines:
                     await websocket.send_text(line.rstrip('\n'))
-                else:
-                    # No new line, wait a bit
-                    await asyncio.sleep(0.1)
+                    sent_count += 1
+
+            logger.info(f"[WebSocket] Sent {sent_count} historical lines")
+        except Exception as read_err:
+            logger.error(f"[WebSocket] Error reading history: {read_err}", exc_info=True)
+            # 如果读取历史失败，从文件末尾开始
+            sent_count = 0
+
+        # 使用文件实际大小作为起始位置
+        last_position = initial_size
+        logger.info(f"[WebSocket] Monitoring from position: {last_position} bytes")
+
+        # 持续监控新内容（类似 tail -f）
+        while True:
+            try:
+                current_size = os.path.getsize(log_file)
+
+                # 如果文件有新内容
+                if current_size > last_position:
+                    with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        f.seek(last_position)
+                        new_content = f.read()
+
+                        if new_content:
+                            # 按行发送
+                            for line in new_content.splitlines():
+                                if line.strip():  # 只发送非空行
+                                    try:
+                                        await websocket.send_text(line)
+                                    except Exception as send_err:
+                                        logger.error(f"[WebSocket] Failed to send line: {send_err}")
+                                        raise  # 重新抛出异常以中断循环
+
+                            last_position = current_size
+
+                # 等待新内容
+                await asyncio.sleep(0.5)
+
+            except FileNotFoundError:
+                # 日志文件被删除或移动
+                logger.warning(f"[WebSocket] Log file no longer exists: {log_file}")
+                try:
+                    await websocket.send_text("Error: Log file no longer exists")
+                except:
+                    pass
+                break
+            except (WebSocketDisconnect, RuntimeError) as e:
+                # 客户端断开连接或连接已关闭
+                logger.info(f"[WebSocket] Connection closed during monitoring: {e}")
+                break
+            except Exception as e:
+                # 其他错误继续尝试
+                logger.error(f"[WebSocket] Error in monitoring loop: {e}", exc_info=True)
+                await asyncio.sleep(1)
 
     except WebSocketDisconnect:
-        pass
+        logger.info(f"[WebSocket] Client disconnected for task {task_id}")
     except Exception as e:
-        await websocket.send_text(f"Error: {str(e)}")
-        await websocket.close()
+        logger.error(f"[WebSocket] Unexpected error for task {task_id}: {e}", exc_info=True)
+        try:
+            await websocket.send_text(f"Error: {str(e)}")
+        except:
+            pass
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 # ==================== Main ====================

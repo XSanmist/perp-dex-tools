@@ -182,7 +182,7 @@ class ExtendedClient(BaseExchangeClient):
             self.logger.log("Streams stopped", "INFO")
             
             # 2. Close the main client connection if it exists
-            if hasattr(self, 'client') and self.perpetual_trading_client:
+            if hasattr(self, 'perpetual_trading_client') and self.perpetual_trading_client:
                 try:
                     await self.perpetual_trading_client.close()
                     self.logger.log("Main client connection closed", "INFO")
@@ -441,6 +441,87 @@ class ExtendedClient(BaseExchangeClient):
 
         return OrderResult(success=False, error_message='Max retries exceeded')
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str, price_offset: Decimal = Decimal('0.0002')) -> OrderResult:
+        """
+        Place a true market order with Extended using IOC (Immediate Or Cancel).
+        This guarantees immediate execution at the best available price.
+
+        Note: price_offset parameter is ignored - kept for API compatibility.
+        """
+        try:
+            from datetime import datetime, timedelta, timezone
+
+            def utc_now():
+                return datetime.now(timezone.utc)
+
+            # Get best bid/ask
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            # For IOC market orders, use a slightly worse price than best to avoid rejection
+            # Extended seems to reject IOC orders at exact best bid/ask
+            # Use 0.05% worse price (穿价 0.05% 避免被拒绝)
+            price_cushion = Decimal('1.0005')  # 0.05% cushion
+
+            if side.lower() == 'buy':
+                # 买单：使用略高于卖一价的价格
+                target_price = best_ask * price_cushion
+            else:
+                # 卖单：使用略低于买一价的价格
+                target_price = best_bid / price_cushion
+
+            # Round price
+            target_price = self.round_to_tick(target_price)
+            quantity = quantity.quantize(self.min_order_size, rounding=ROUND_HALF_UP)
+
+            # Convert side
+            order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+
+            self.logger.log(f"Extended IOC market order: {side} {quantity} @ {target_price} (BBO: {best_bid}/{best_ask})", level="INFO")
+
+            # Place IOC order - executes immediately or cancels unfilled portion
+            order_result = await self.perpetual_trading_client.place_order(
+                market_name=contract_id,
+                amount_of_synthetic=quantity,
+                price=target_price,
+                side=order_side,
+                time_in_force=TimeInForce.IOC,  # Immediate Or Cancel - guarantees immediate execution
+                post_only=False,
+                expire_time=utc_now() + timedelta(days=1),  # 设置较长过期时间避免网络延迟导致订单过期
+            )
+
+            # 打印完整的 order_result 用于调试
+            self.logger.log(f"IOC 下单返回完整数据: order_result={order_result}", level="INFO")
+            if order_result:
+                self.logger.log(f"  status={order_result.status}", level="INFO")
+                if hasattr(order_result, 'data') and order_result.data:
+                    self.logger.log(f"  data={order_result.data}", level="INFO")
+                    if hasattr(order_result.data, '__dict__'):
+                        self.logger.log(f"  data.__dict__={order_result.data.__dict__}", level="INFO")
+
+            if not order_result or not order_result.data or order_result.status != 'OK':
+                error_msg = 'Failed to place market order'
+                if order_result:
+                    error_msg += f' (status: {order_result.status})'
+                self.logger.log(error_msg, level="ERROR")
+                return OrderResult(success=False, error_message=error_msg)
+
+            order_id = order_result.data.id
+          
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                side=side,
+                size=quantity,
+                price=target_price,
+                status='OPEN'  # IOC orders fill immediately, but we return OPEN for API compatibility
+            )
+
+        except Exception as e:
+            self.logger.log(f"Failed to place market order: {e}", level="ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Extended using the internal order ID."""
         try:
@@ -505,9 +586,12 @@ class ExtendedClient(BaseExchangeClient):
                     async with session.get(url, headers=headers) as response:
                         if response.status == 200:
                             data = await response.json()
-                            
+
+                            # 打印完整的响应数据用于调试
+                            self.logger.log(f"Extended API 响应 (order_id={order_id}, attempt={attempt}): {data}", "INFO")
+
                             if data.get("status") != "OK" or not data.get("data"):
-                                self.logger.log(f"Failed to get order info attempt {attempt} for {order_id}: {data}", "ERROR")
+                                self.logger.log(f"Failed to get order info attempt {attempt} for {order_id}: status={data.get('status')}, has_data={bool(data.get('data'))}", "ERROR")
                                 return None
                             
                             order_data = data["data"]
@@ -631,13 +715,59 @@ class ExtendedClient(BaseExchangeClient):
                         break
 
                 if position:
+                    # Return absolute position for compatibility with existing bots
                     position_amt = abs(Decimal(position.size))
                 else:
                     position_amt = 0
             else:
                 position_amt = 0
         return position_amt
-    
+
+    @query_retry(default_return=None)
+    async def get_signed_position(self) -> Decimal:
+        """
+        Get signed position for hedge mode.
+        Returns: Decimal with sign (positive for long, negative for short)
+
+        Note: Extended API (X10 SDK) uses separate fields:
+        - position.size: unsigned Decimal (always positive)
+        - position.side: PositionSide enum (LONG or SHORT)
+        """
+        # Get positions from API
+        positions_data = await self.perpetual_trading_client.account.get_positions(market_names=[self.config.ticker+"-USD"])
+        if not positions_data or not hasattr(positions_data, 'data'):
+            self.logger.log("No positions or failed to get positions", "WARNING")
+            return Decimal('0')
+
+        positions = positions_data.data
+        if positions:
+            # Find position for current contract
+            position = None
+            for p in positions:
+                if p.market == self.config.contract_id:
+                    position = p
+                    break
+
+            if position:
+                # Get unsigned size
+                size_value = Decimal(position.size)
+
+                # Check position side to determine sign
+                # position.side is a PositionSide enum: LONG or SHORT
+                if hasattr(position, 'side'):
+                    side = str(position.side).upper()
+                    if 'SHORT' in side:
+                        size_value = -size_value
+                        self.logger.log(f"Extended SHORT position: {size_value}", "DEBUG")
+                    else:
+                        self.logger.log(f"Extended LONG position: {size_value}", "DEBUG")
+                else:
+                    self.logger.log(f"WARNING: No 'side' field in Extended position, assuming LONG: {size_value}", "WARNING")
+
+                return size_value
+
+        return Decimal('0')
+
     async def handle_account(self, message):
         """Handle order updates from WebSocket using correct pattern."""
         try:
@@ -664,7 +794,9 @@ class ExtendedClient(BaseExchangeClient):
                         side = order.get('side', '').lower()
                         filled_size = order.get('filledQty')
 
-                        if side == self.config.close_order_side:
+                        # Safe attribute access for compatibility
+                        close_order_side = getattr(self.config, 'close_order_side', None)
+                        if close_order_side is not None and side == close_order_side:
                             order_type = "CLOSE"
                         else:
                             order_type = "OPEN"

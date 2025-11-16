@@ -518,7 +518,7 @@ class ApexClient(BaseExchangeClient):
                 ))
         return contract_orders
 
-    @query_retry(default_return=0)
+    @query_retry(default_return=None)
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
         account_data = self.rest_client.get_account_v3()

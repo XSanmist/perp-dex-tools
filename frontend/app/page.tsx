@@ -30,8 +30,10 @@ interface Process {
   ticker?: string;
   current_iteration?: number;
   total_iterations?: number;
-  extended_position?: number;
-  lighter_position?: number;
+  primary_position?: number;
+  secondary_position?: number;
+  primary_exchange?: string;
+  secondary_exchange?: string;
   runtime_seconds?: number;
 }
 
@@ -47,7 +49,8 @@ export default function Home() {
   const [error, setError] = useState<{ title: string; message: string } | null>(null);
   const [, setCurrentTime] = useState(Date.now()); // 用于触发运行时间的更新
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const logIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const currentTaskIdRef = useRef<string | null>(null); // 跟踪当前连接的任务 ID
 
   // 获取 API Key
   const getApiKey = () => {
@@ -139,8 +142,10 @@ export default function Home() {
             ticker,
             current_iteration: info.current_iteration,
             total_iterations: info.total_iterations,
-            extended_position: info.extended_position,
-            lighter_position: info.lighter_position,
+            primary_position: info.primary_position,
+            secondary_position: info.secondary_position,
+            primary_exchange: info.primary_exchange,
+            secondary_exchange: info.secondary_exchange,
             runtime_seconds: info.runtime_seconds
           };
         });
@@ -165,27 +170,64 @@ export default function Home() {
     }
   };
 
-  // 获取日志
-  const fetchLogs = async (pid: number) => {
-    try {
-      // 找到对应的任务获取exchange和ticker信息
-      const task = tasks.find(t => t.pid === pid);
-      if (!task || !task.exchange || !task.ticker) {
-        console.error('Task not found or missing exchange/ticker');
-        return;
-      }
+  // 建立 WebSocket 连接获取实时日志
+  const connectWebSocket = (taskId: string) => {
+    // 如果已经连接到同一个任务,不需要重连
+    if (wsRef.current && currentTaskIdRef.current === taskId) {
+      return;
+    }
 
-      const response = await fetch(`http://localhost:8000/logs/${task.exchange}/${task.ticker}?lines=100`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.logs) {
-          // 将日志文本按行分割
-          const logLines = data.logs.split('\n').filter((line: string) => line.trim());
-          setLogs(logLines);
+    // 关闭现有连接
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    // 清空现有日志
+    setLogs([]);
+
+    try {
+      // 建立新连接（使用任务 ID）
+      const ws = new WebSocket(`ws://localhost:8000/ws/logs/${taskId}`);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        const logLine = event.data;
+        if (logLine && logLine.trim()) {
+          // 检查是否是错误消息
+          if (logLine.startsWith('Error:')) {
+            toast.error('Log Error', {
+              description: logLine,
+              duration: 5000,
+            });
+          } else {
+            setLogs(prevLogs => {
+              // 限制最大日志行数为 5000，避免 DOM 过载
+              const newLogs = [...prevLogs, logLine];
+              if (newLogs.length > 5000) {
+                return newLogs.slice(-5000);  // 只保留最后 5000 行
+              }
+              return newLogs;
+            });
+          }
         }
-      }
+      };
+
+      ws.onerror = () => {
+        toast.error('Log Connection Error', {
+          description: 'Failed to connect to log stream. Logs may not be available.',
+          duration: 3000,
+        });
+      };
+
+      ws.onclose = () => {
+        wsRef.current = null;
+      };
     } catch (error) {
-      console.error('Failed to fetch logs:', error);
+      toast.error('WebSocket Error', {
+        description: 'Failed to establish real-time log connection.',
+        duration: 3000,
+      });
     }
   };
 
@@ -231,13 +273,21 @@ export default function Home() {
       if (formData.type === 'hedge') {
         endpoint = '/hedge';
         body = {
-          exchange: formData.exchange,
+          hedgeMode: formData.hedgeMode || 'classic',
           ticker: formData.ticker,
           size: parseFloat(formData.size),
           iter: parseInt(formData.iterations),
           sleep: parseInt(formData.sleep),
           fill_timeout: parseInt(formData.fillTimeout)
         };
+
+        // 根据对冲模式添加不同的交易所参数
+        if (formData.hedgeMode === 'dual') {
+          body.primaryExchange = formData.primaryExchange;
+          body.secondaryExchange = formData.secondaryExchange;
+        } else {
+          body.exchange = formData.exchange;
+        }
       } else if (formData.type === 'momentum') {
         endpoint = '/momentum';
         body = {
@@ -303,30 +353,38 @@ export default function Home() {
     return () => clearInterval(timer);
   }, []);
 
-  // 当选中任务改变时，获取日志
+  // 当选中任务改变时，建立 WebSocket 连接获取实时日志
   useEffect(() => {
     if (selectedTask && tasks.length > 0) {
-      // 立即获取日志
-      fetchLogs(selectedTask);
-
-      // 清理之前的定时器
-      if (logIntervalRef.current) {
-        clearInterval(logIntervalRef.current);
+      const task = tasks.find(t => t.pid === selectedTask);
+      if (task && task.id) {
+        // 只有当任务 ID 实际改变时才重新连接
+        if (currentTaskIdRef.current !== task.id) {
+          currentTaskIdRef.current = task.id;
+          connectWebSocket(task.id);
+        }
       }
-
-      // 每2秒获取新日志
-      logIntervalRef.current = setInterval(() => {
-        fetchLogs(selectedTask);
-      }, 2000);
+    } else {
+      // 如果取消选择，关闭 WebSocket 连接
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      currentTaskIdRef.current = null;
+      setLogs([]);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTask]); // 只依赖 selectedTask，不依赖 tasks
 
+  // 组件卸载时清理 WebSocket
+  useEffect(() => {
     return () => {
-      if (logIntervalRef.current) {
-        clearInterval(logIntervalRef.current);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTask, tasks]);
+  }, []);
 
   // Auto-scroll to bottom when new logs arrive
   useEffect(() => {
@@ -462,16 +520,17 @@ export default function Home() {
                               </div>
                             </div>
                           )}
-                          {task.extended_position !== undefined && task.extended_position !== null && (
+                          {/* Position display */}
+                          {task.primary_position !== undefined && task.primary_position !== null && (
                             <div className="flex justify-between">
-                              <span>Extended:</span>
-                              <span className="text-gray-300">{task.extended_position.toFixed(4)}</span>
+                              <span>{task.primary_exchange || 'Primary'}:</span>
+                              <span className="text-gray-300">{task.primary_position.toFixed(4)}</span>
                             </div>
                           )}
-                          {task.lighter_position !== undefined && task.lighter_position !== null && (
+                          {task.secondary_position !== undefined && task.secondary_position !== null && (
                             <div className="flex justify-between">
-                              <span>Lighter:</span>
-                              <span className="text-gray-300">{task.lighter_position.toFixed(4)}</span>
+                              <span>{task.secondary_exchange || 'Secondary'}:</span>
+                              <span className="text-gray-300">{task.secondary_position.toFixed(4)}</span>
                             </div>
                           )}
                         </div>
@@ -546,8 +605,9 @@ export default function Home() {
               </Card>
               <Card className={(() => {
                 const task = tasks.find(t => t.pid === selectedTask);
-                if (task?.extended_position !== undefined && task?.lighter_position !== undefined) {
-                  const delta = (task.extended_position ?? 0) + (task.lighter_position ?? 0);
+                // Calculate delta
+                if (task?.primary_position !== undefined && task?.secondary_position !== undefined) {
+                  const delta = (task.primary_position ?? 0) + (task.secondary_position ?? 0);
                   return delta !== 0 ? "bg-card border-red-500" : "bg-card border-gray-800";
                 }
                 return "bg-card border-gray-800";
@@ -558,17 +618,18 @@ export default function Home() {
                     {selectedTask
                       ? (() => {
                           const task = tasks.find(t => t.pid === selectedTask);
-                          if (task?.extended_position !== undefined && task?.lighter_position !== undefined) {
-                            const delta = (task.extended_position ?? 0) + (task.lighter_position ?? 0);
+                          // Position display
+                          if (task?.primary_position !== undefined && task?.secondary_position !== undefined) {
+                            const delta = (task.primary_position ?? 0) + (task.secondary_position ?? 0);
                             return (
                               <div className="space-y-1">
                                 <div className="flex justify-between text-sm">
-                                  <span className="text-gray-400">Extended:</span>
-                                  <span>{(task.extended_position ?? 0).toFixed(4)}</span>
+                                  <span className="text-gray-400">{task.primary_exchange || 'Primary'}:</span>
+                                  <span>{(task.primary_position ?? 0).toFixed(4)}</span>
                                 </div>
                                 <div className="flex justify-between text-sm">
-                                  <span className="text-gray-400">Lighter:</span>
-                                  <span>{(task.lighter_position ?? 0).toFixed(4)}</span>
+                                  <span className="text-gray-400">{task.secondary_exchange || 'Secondary'}:</span>
+                                  <span>{(task.secondary_position ?? 0).toFixed(4)}</span>
                                 </div>
                                 <div className="flex justify-between text-sm border-t border-gray-700 pt-1 mt-1">
                                   <span className="text-gray-400">Delta:</span>

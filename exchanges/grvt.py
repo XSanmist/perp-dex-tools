@@ -104,12 +104,19 @@ class GrvtClient(BaseExchangeClient):
 
             # Initialize and connect
             await self._ws_client.initialize()
+            self.logger.log("WebSocket initialized", "INFO")
             await asyncio.sleep(2)  # Wait for connection to establish
 
             # If an order update callback was set before connect, subscribe now
             if self._order_update_callback is not None:
+                self.logger.log(f"Starting order subscription for {self.config.contract_id}...", "INFO")
+                # Note: GRVT SDK's subscribe() doesn't return immediately, so we use create_task
+                # and give it a short delay to ensure the subscription request is sent
                 asyncio.create_task(self._subscribe_to_orders(self._order_update_callback))
-                self.logger.log(f"Deferred subscription started for {self.config.contract_id}", "INFO")
+                await asyncio.sleep(0.5)  # Give SDK time to initiate subscription
+                self.logger.log(f"Order subscription initiated for {self.config.contract_id}", "INFO")
+            else:
+                self.logger.log("WARNING: No order update callback set before connect!", "WARNING")
 
         except Exception as e:
             self.logger.log(f"Error connecting to GRVT WebSocket: {e}", "ERROR")
@@ -154,11 +161,15 @@ class GrvtClient(BaseExchangeClient):
                         side = 'buy' if leg.get('is_buying_asset') else 'sell'
                         size = leg.get('size', '0')
                         price = leg.get('limit_price', '0')
-                        filled_size = order_state.get('traded_size')[0] if order_state.get('traded_size') else '0'
+                        # Safely extract filled_size from traded_size array
+                        traded_size = order_state.get('traded_size', [])
+                        filled_size = traded_size[0] if (traded_size and len(traded_size) > 0) else '0'
 
                         if order_id and status:
                             # Determine order type based on side
-                            if side == self.config.close_order_side:
+                            # Use getattr to support both hedge mode (no close_order_side) and normal mode
+                            close_order_side = getattr(self.config, 'close_order_side', None)
+                            if close_order_side is not None and side == close_order_side:
                                 order_type = "CLOSE"
                             else:
                                 order_type = "OPEN"
@@ -178,7 +189,7 @@ class GrvtClient(BaseExchangeClient):
 
                             if mapped_status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED']:
                                 if self._order_update_handler:
-                                    self._order_update_handler({
+                                    order_update_data = {
                                         'order_id': order_id,
                                         'side': side,
                                         'order_type': order_type,
@@ -187,7 +198,10 @@ class GrvtClient(BaseExchangeClient):
                                         'price': price,
                                         'contract_id': contract_id,
                                         'filled_size': filled_size
-                                    })
+                                    }
+                                    self.logger.log(f"Calling order update handler with: {order_update_data}", "INFO")
+                                    # Call async handler
+                                    asyncio.create_task(self._order_update_handler(order_update_data))
                             else:
                                 self.logger.log(f"Ignoring order update with status: {mapped_status}", "DEBUG")
                         else:
@@ -206,16 +220,9 @@ class GrvtClient(BaseExchangeClient):
         # Store callback for use after connect
         self._order_update_callback = order_update_callback
 
-        # Subscribe immediately if WebSocket is already initialized; otherwise defer to connect()
-        if self._ws_client:
-            try:
-                asyncio.create_task(self._subscribe_to_orders(self._order_update_callback))
-                self.logger.log(f"Successfully initiated subscription to order updates for {self.config.contract_id}", "INFO")
-            except Exception as e:
-                self.logger.log(f"Error subscribing to order updates: {e}", "ERROR")
-                raise
-        else:
-            self.logger.log("WebSocket not ready yet; will subscribe after connect()", "INFO")
+        # Note: We don't subscribe here even if WebSocket is ready
+        # Instead, we defer all subscriptions to connect() to ensure proper timing
+        self.logger.log("Order update handler registered; will subscribe when connect() is called", "INFO")
 
     async def _subscribe_to_orders(self, callback):
         """Subscribe to order updates asynchronously."""
@@ -252,19 +259,26 @@ class GrvtClient(BaseExchangeClient):
                                     side: str) -> OrderResult:
         """Place a post only order with GRVT using official SDK."""
 
-        # Place the order using GRVT SDK
-        order_result = self.rest_client.create_limit_order(
-            symbol=contract_id,
-            side=side,
-            amount=quantity,
-            price=price,
-            params={
-                'post_only': True,
-                'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
-            }
-        )
+        try:
+            # Place the order using GRVT SDK
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=price,
+                params={
+                    'post_only': True,
+                    'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
+                }
+            )
+        except Exception as e:
+            # Capture and re-raise SDK errors with more context
+            error_msg = str(e)
+            self.logger.log(f"[OPEN] GRVT SDK error: {error_msg}", "ERROR")
+            raise Exception(f"[OPEN] GRVT order failed: {error_msg}")
+
         if not order_result:
-            raise Exception(f"[OPEN] Error placing order")
+            raise Exception(f"[OPEN] Error placing order: GRVT returned empty result")
 
         client_order_id = order_result.get('metadata').get('client_order_id')
         order_status = order_result.get('state').get('status')
@@ -301,7 +315,8 @@ class GrvtClient(BaseExchangeClient):
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with GRVT."""
         attempt = 0
-        while True:
+        max_attempts = 10  # Maximum retry attempts
+        while attempt < max_attempts:
             attempt += 1
             if attempt % 5 == 0:
                 self.logger.log(f"[OPEN] Attempt {attempt} to place order", "INFO")
@@ -333,6 +348,8 @@ class GrvtClient(BaseExchangeClient):
                 order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
             except Exception as e:
                 self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
+                if attempt >= max_attempts:
+                    raise Exception(f"[OPEN] Failed after {max_attempts} attempts: {e}")
                 continue
 
             order_status = order_info.status
@@ -358,8 +375,9 @@ class GrvtClient(BaseExchangeClient):
         """Place a close order with GRVT."""
         # Get current market prices
         attempt = 0
+        max_attempts = 10  # Maximum retry attempts
         active_close_orders = await self._get_active_close_orders(contract_id)
-        while True:
+        while attempt < max_attempts:
             attempt += 1
             if attempt % 5 == 0:
                 self.logger.log(f"[CLOSE] Attempt {attempt} to place order", "INFO")
@@ -388,6 +406,8 @@ class GrvtClient(BaseExchangeClient):
                 order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
             except Exception as e:
                 self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
+                if attempt >= max_attempts:
+                    raise Exception(f"[CLOSE] Failed after {max_attempts} attempts: {e}")
                 continue
 
             order_status = order_info.status
@@ -408,6 +428,81 @@ class GrvtClient(BaseExchangeClient):
                 raise Exception("[CLOSE] Order not processed after 10 seconds")
             else:
                 raise Exception(f"[CLOSE] Unexpected order status: {order_status}")
+
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str, price_offset: Decimal = Decimal('0.0002')) -> OrderResult:
+        """
+        Place a market-like order with GRVT for immediate execution.
+        Uses limit order with post_only=False and aggressive pricing.
+        """
+        try:
+            # Get best bid/ask
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            # Use the provided price_offset parameter
+
+            if side.lower() == 'buy':
+                # Buy: price above best ask to ensure immediate fill
+                target_price = best_ask * (Decimal('1') + price_offset)
+            else:
+                # Sell: price below best bid to ensure immediate fill
+                target_price = best_bid * (Decimal('1') - price_offset)
+
+            # Round price
+            target_price = self.round_to_tick(target_price)
+
+            self.logger.log(f"GRVT market order: {side} {quantity} @ {target_price} (BBO: {best_bid}/{best_ask})", level="INFO")
+
+            # Place limit order with post_only=False (allows taker execution)
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=target_price,
+                params={
+                    'post_only': False,  # Key: allows immediate execution as taker
+                    'order_duration_secs': 30 * 86400 - 1,
+                }
+            )
+
+            if not order_result:
+                return OrderResult(success=False, error_message='GRVT returned empty result')
+
+            client_order_id = order_result.get('metadata', {}).get('client_order_id')
+            order_status = order_result.get('state', {}).get('status')
+
+            # Wait for order to be processed
+            order_status_start_time = time.time()
+            order_info = await self.get_order_info(client_order_id=client_order_id)
+            if order_info is not None:
+                order_status = order_info.status
+
+            while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
+                await asyncio.sleep(0.05)
+                order_info = await self.get_order_info(client_order_id=client_order_id)
+                if order_info is not None:
+                    order_status = order_info.status
+
+            if order_status == 'PENDING':
+                return OrderResult(success=False, error_message='Order not processed after 10 seconds')
+            elif order_status in ['OPEN', 'FILLED', 'PARTIALLY_FILLED']:
+                return OrderResult(
+                    success=True,
+                    order_id=order_info.order_id if order_info else client_order_id,
+                    side=side,
+                    size=quantity,
+                    price=target_price,
+                    status=order_status
+                )
+            elif order_status == 'REJECTED':
+                return OrderResult(success=False, error_message='Order rejected by GRVT')
+            else:
+                return OrderResult(success=False, error_message=f'Unexpected order status: {order_status}')
+
+        except Exception as e:
+            self.logger.log(f"Failed to place market order: {e}", level="ERROR")
+            return OrderResult(success=False, error_message=str(e))
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with GRVT."""
@@ -507,6 +602,21 @@ class GrvtClient(BaseExchangeClient):
         for position in positions:
             if position.get('instrument') == self.config.contract_id:
                 return abs(Decimal(position.get('size', 0)))
+
+        return Decimal(0)
+
+    @query_retry(reraise=True)
+    async def get_signed_position(self) -> Decimal:
+        """
+        Get signed position for hedge mode.
+        Returns: Decimal with sign (positive for long, negative for short)
+        """
+        positions = self.rest_client.fetch_positions()
+
+        for position in positions:
+            if position.get('instrument') == self.config.contract_id:
+                # Return SIGNED position: positive for long, negative for short
+                return Decimal(position.get('size', 0))
 
         return Decimal(0)
 

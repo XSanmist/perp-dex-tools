@@ -553,7 +553,7 @@ class BackpackClient(BaseExchangeClient):
 
         return orders
 
-    @query_retry(default_return=0)
+    @query_retry(default_return=None)
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
         positions_data = self.account_client.get_open_positions()

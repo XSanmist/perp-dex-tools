@@ -100,6 +100,27 @@ class BaseExchangeClient(ABC):
         pass
 
     @abstractmethod
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str, price_offset: Decimal = Decimal('0.0002')) -> OrderResult:
+        """
+        Place a market order or aggressive limit order for immediate execution.
+
+        This order should execute immediately as a taker (non-post-only).
+        Implementations can use native market orders or aggressive limit pricing.
+
+        Args:
+            contract_id: Contract identifier
+            quantity: Order quantity
+            side: Order side ('buy' or 'sell')
+            price_offset: Price offset from BBO as a decimal (default: 0.0002 = 0.02%)
+                         For buy orders: price = best_ask * (1 + price_offset)
+                         For sell orders: price = best_bid * (1 - price_offset)
+
+        Returns:
+            OrderResult with order details
+        """
+        pass
+
+    @abstractmethod
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order."""
         pass
