@@ -154,6 +154,9 @@ class ProcessInfo(BaseModel):
     primary_exchange: Optional[str] = None
     secondary_exchange: Optional[str] = None
     runtime_seconds: Optional[int] = None
+    # RTT information (Round-Trip Time in milliseconds)
+    primary_rtt_ms: Optional[float] = None
+    secondary_rtt_ms: Optional[float] = None
 
 
 # ==================== Global State ====================
@@ -459,6 +462,10 @@ async def list_processes(api_key: str = Depends(verify_api_key)):
             info_dict['secondary_position'] = status.get('secondary_position')
             info_dict['primary_exchange'] = status.get('primary_exchange')
             info_dict['secondary_exchange'] = status.get('secondary_exchange')
+
+            # RTT information
+            info_dict['primary_rtt_ms'] = status.get('primary_rtt_ms')
+            info_dict['secondary_rtt_ms'] = status.get('secondary_rtt_ms')
 
         result[task_id] = ProcessInfo(**info_dict)
 

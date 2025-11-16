@@ -35,6 +35,8 @@ interface Process {
   primary_exchange?: string;
   secondary_exchange?: string;
   runtime_seconds?: number;
+  primary_rtt_ms?: number | null;
+  secondary_rtt_ms?: number | null;
 }
 
 export default function Home() {
@@ -146,7 +148,9 @@ export default function Home() {
             secondary_position: info.secondary_position,
             primary_exchange: info.primary_exchange,
             secondary_exchange: info.secondary_exchange,
-            runtime_seconds: info.runtime_seconds
+            runtime_seconds: info.runtime_seconds,
+            primary_rtt_ms: info.primary_rtt_ms,
+            secondary_rtt_ms: info.secondary_rtt_ms,
           };
         });
 
@@ -645,6 +649,40 @@ export default function Home() {
                 </CardContent>
               </Card>
             </div>
+
+            {/* RTT Stats */}
+            {selectedTask && (() => {
+              const task = tasks.find(t => t.pid === selectedTask);
+              if (task && (task.primary_rtt_ms !== undefined || task.secondary_rtt_ms !== undefined)) {
+                return (
+                  <div className="grid grid-cols-2 gap-4 mb-6">
+                    {task.primary_rtt_ms !== undefined && task.primary_rtt_ms !== null && (
+                      <Card className="bg-card border-gray-800">
+                        <CardContent className="p-4">
+                          <div className="text-sm text-gray-400 mb-1">{task.primary_exchange || 'Primary'} RTT</div>
+                          <div className="text-2xl font-bold text-white">
+                            {task.primary_rtt_ms.toFixed(1)} ms
+                          </div>
+                          <div className="text-xs text-gray-500 mt-1">Average round-trip time</div>
+                        </CardContent>
+                      </Card>
+                    )}
+                    {task.secondary_rtt_ms !== undefined && task.secondary_rtt_ms !== null && (
+                      <Card className="bg-card border-gray-800">
+                        <CardContent className="p-4">
+                          <div className="text-sm text-gray-400 mb-1">{task.secondary_exchange || 'Secondary'} RTT</div>
+                          <div className="text-2xl font-bold text-white">
+                            {task.secondary_rtt_ms.toFixed(1)} ms
+                          </div>
+                          <div className="text-xs text-gray-500 mt-1">Average round-trip time</div>
+                        </CardContent>
+                      </Card>
+                    )}
+                  </div>
+                );
+              }
+              return null;
+            })()}
 
             {/* Log Viewer */}
             <Card className="bg-card border-gray-800 h-[600px] flex flex-col">

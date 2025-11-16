@@ -173,6 +173,16 @@ class DualExchangeHedge:
             except Exception as e:
                 self.logger.debug(f"查询副交易所仓位失败: {e}")
 
+        # 获取两个交易所的平均 RTT
+        primary_rtt = None
+        secondary_rtt = None
+
+        if self.primary_client:
+            primary_rtt = self.primary_client.get_avg_rtt()
+
+        if self.secondary_client:
+            secondary_rtt = self.secondary_client.get_avg_rtt()
+
         status_data[self.task_id] = {
             'current_iteration': self.current_iteration,
             'total_iterations': self.config.iterations,
@@ -180,7 +190,9 @@ class DualExchangeHedge:
             'secondary_position': float(secondary_pos),
             'primary_exchange': self.config.primary_exchange,
             'secondary_exchange': self.config.secondary_exchange,
-            'runtime_seconds': runtime_seconds
+            'runtime_seconds': runtime_seconds,
+            'primary_rtt_ms': round(primary_rtt, 1) if primary_rtt is not None else None,
+            'secondary_rtt_ms': round(secondary_rtt, 1) if secondary_rtt is not None else None,
         }
 
         try:
