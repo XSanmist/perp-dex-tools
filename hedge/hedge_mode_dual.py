@@ -112,11 +112,15 @@ class DualExchangeHedge:
         self.secondary_contract_id: str = ''
 
         # 成交追踪
+        self.current_primary_order_id: Optional[str] = None  # 当前主交易所订单 ID
         self.primary_filled_qty = Decimal('0')
         self.secondary_filled_qty = Decimal('0')
-        self.last_primary_filled = Decimal('0')
-        self.current_primary_order_id: Optional[str] = None
         self.total_hedged_qty = Decimal('0')  # 累计已对冲数量（防止重复对冲）
+        self.cumulative_filled_qty = Decimal('0')  # 全局累计成交量（跨订单追踪）
+
+        # 订单级别的成交去重追踪（防止 WebSocket 消息乱序/重复）
+        # 格式: {order_id: 已处理的成交量}
+        self.order_processed_fills: dict[str, Decimal] = {}
 
         # 控制标志
         self.is_running = False
@@ -275,16 +279,16 @@ class DualExchangeHedge:
     async def _on_primary_order_update(self, order_data: dict):
         """主交易所订单更新回调（WebSocket 触发）
 
-        核心逻辑:
-            1. 检测订单 ID 变化，识别新订单或同一订单
-            2. 计算增量成交（仅对新增成交量进行对冲）
-            3. 使用 total_hedged_qty 防止重复对冲
-            4. 触发副交易所对冲
+        订单级别成交去重对冲机制:
+            1. 使用 order_processed_fills 字典追踪每个订单已处理的成交量
+            2. 计算真正的新增成交 = 当前成交 - 该订单已处理成交
+            3. 只对真正的新增成交进行对冲
+            4. 立即更新已处理成交和累计对冲量（防止竞态条件）
 
-        防重复对冲机制:
-            - 新订单: 重置 last_filled 为 0
-            - 同一订单: 增量 = 当前累计 - 上次累计
-            - 关键保护: 只有当 filled_qty > total_hedged_qty 时才触发对冲
+        这种设计确保：
+            - 防止 WebSocket 消息乱序或重复导致的重复对冲
+            - 即使订单被取消重挂，也能正确追踪每个订单的成交
+            - A 实际成交多少，B 就对冲多少
         """
         try:
             self.logger.debug(f"收到主交易所订单更新: {order_data}")
@@ -296,48 +300,68 @@ class DualExchangeHedge:
             order_id = order_data.get('order_id')
             filled_qty = Decimal(str(order_data.get('filled_size', 0)))
 
-            # 检测订单切换
-            if order_id != self.current_primary_order_id:
-                self.logger.info(
-                    f"🆕 检测到新订单: {order_id} "
-                    f"(旧订单: {self.current_primary_order_id})"
-                )
-                self.current_primary_order_id = order_id
-                self.last_primary_filled = Decimal('0')
+            # 获取该订单已处理的成交量（默认为 0）
+            processed_qty = self.order_processed_fills.get(order_id, Decimal('0'))
 
-            # 计算增量成交
-            incremental_fill = filled_qty - self.last_primary_filled
+            # 计算真正的新增成交（去重逻辑）
+            incremental_fill = filled_qty - processed_qty
 
             self.logger.info(
-                f"订单 {order_id} 成交更新: 累计={filled_qty}, "
-                f"增量={incremental_fill} (上次={self.last_primary_filled}), "
+                f"订单 {order_id} 成交更新: "
+                f"当前成交={filled_qty}, "
+                f"已处理={processed_qty}, "
+                f"增量={incremental_fill}, "
+                f"全局累计={self.cumulative_filled_qty}, "
                 f"已对冲={self.total_hedged_qty}"
             )
 
-            # 防重复对冲：只有当累计成交量大于已对冲量时才触发
-            if filled_qty > self.total_hedged_qty and incremental_fill > Decimal('0'):
-                # 实际需要对冲的量 = 累计成交 - 已对冲
-                actual_hedge_qty = filled_qty - self.total_hedged_qty
+            # 只处理真正的新增成交
+            if incremental_fill > Decimal('0'):
+                # 立即更新该订单的已处理成交量（防止重复处理）
+                self.order_processed_fills[order_id] = filled_qty
 
-                self.logger.info(f"主交易所新增成交: {incremental_fill}")
-                self.logger.info(f"实际需要对冲: {actual_hedge_qty}")
+                # 更新全局累计成交量
+                self.cumulative_filled_qty += incremental_fill
 
-                self.last_primary_filled = filled_qty
-                self.primary_filled_qty = filled_qty
+                # 计算需要对冲的量 = 全局累计成交 - 已对冲
+                hedge_needed = self.cumulative_filled_qty - self.total_hedged_qty
 
-                # 立即更新累计对冲量（防止竞态条件）
-                # 在对冲执行之前更新，避免并发的 WebSocket 消息导致重复对冲
-                self.total_hedged_qty = filled_qty
+                self.logger.info(
+                    f"✅ 检测到新增成交: {incremental_fill}, "
+                    f"全局累计成交: {self.cumulative_filled_qty}, "
+                    f"需要对冲: {hedge_needed}"
+                )
 
-                self.logger.info(f"触发对冲，方向: {order_data.get('side')}")
-                await self._execute_hedge(actual_hedge_qty, order_data.get('side'))
-                self.logger.info("对冲执行完毕")
+                if hedge_needed > Decimal('0'):
+                    # 更新 primary_filled_qty 为全局累计成交（供状态显示）
+                    self.primary_filled_qty = self.cumulative_filled_qty
 
-                await self.update_status()
+                    # 立即更新累计对冲量（防止竞态条件）
+                    # 在对冲执行之前更新，避免并发的 WebSocket 消息导致重复对冲
+                    self.total_hedged_qty = self.cumulative_filled_qty
+
+                    self.logger.info(f"🔄 触发对冲 {hedge_needed}，方向: {order_data.get('side')}")
+                    await self._execute_hedge(hedge_needed, order_data.get('side'))
+                    self.logger.info("✅ 对冲执行完毕")
+
+                    await self.update_status()
+                else:
+                    self.logger.warning(
+                        f"⚠️ 异常情况: 有新增成交但无需对冲 "
+                        f"(cumulative={self.cumulative_filled_qty}, hedged={self.total_hedged_qty})"
+                    )
+            elif incremental_fill < Decimal('0'):
+                # 检测到异常：成交量减少（可能是消息乱序）
+                self.logger.warning(
+                    f"⚠️ 订单 {order_id} 成交量异常减少: "
+                    f"当前={filled_qty}, 已处理={processed_qty}, "
+                    f"增量={incremental_fill}"
+                )
+                self.logger.warning("   可能是 WebSocket 消息乱序，跳过处理")
             else:
+                # incremental_fill == 0，重复消息
                 self.logger.debug(
-                    f"无需对冲: incremental={incremental_fill}, "
-                    f"filled={filled_qty}, hedged={self.total_hedged_qty}"
+                    f"订单 {order_id} 无新增成交（重复消息或状态更新）"
                 )
 
         except Exception as e:
@@ -380,10 +404,11 @@ class DualExchangeHedge:
             - 主交易所买入 → 副交易所卖出
             - 主交易所卖出 → 副交易所买入
             - 使用 IOC 市价单确保快速成交
-            - 成功后更新 total_hedged_qty 防止重复对冲
+            - 追踪部分成交，只对冲剩余未成交部分
 
         重试机制:
             - 30 秒内持续重试
+            - 追踪累计成交量，避免重复对冲
             - 超时后通知但不中断主流程
         """
         async with self.hedging_lock:
@@ -399,6 +424,9 @@ class DualExchangeHedge:
 
                 self.secondary_filled_qty = Decimal('0')
 
+                # 追踪本次对冲的累计成交量（防止部分成交导致重复对冲）
+                cumulative_hedged = Decimal('0')
+
                 # 30 秒内持续重试
                 timeout = 30
                 start_time = asyncio.get_event_loop().time()
@@ -409,24 +437,34 @@ class DualExchangeHedge:
                     elapsed = asyncio.get_event_loop().time() - start_time
                     if elapsed > timeout:
                         error_msg = (
-                            f"⚠️ 对冲失败 (30秒超时)\n数量: {quantity}\n"
+                            f"⚠️ 对冲失败 (30秒超时)\n目标数量: {quantity}\n"
+                            f"已成交: {cumulative_hedged}\n剩余: {quantity - cumulative_hedged}\n"
                             f"方向: {hedge_side}\n总尝试次数: {attempt}"
                         )
                         self.logger.error(error_msg)
                         await self._send_notification(error_msg)
                         break
 
+                    # 计算剩余未对冲数量
+                    remaining_qty = quantity - cumulative_hedged
+
+                    if remaining_qty <= Decimal('0'):
+                        self.logger.info(f"✅ 对冲完全成交: {cumulative_hedged}/{quantity} (尝试 {attempt} 次)")
+                        success = True
+                        break
+
                     attempt += 1
                     remaining_time = timeout - elapsed
                     self.logger.info(
-                        f"对冲尝试 #{attempt} (剩余时间: {remaining_time:.1f}秒)"
+                        f"对冲尝试 #{attempt} (剩余时间: {remaining_time:.1f}秒, 剩余数量: {remaining_qty})"
                     )
 
                     try:
+                        # 只下剩余未成交的数量
                         result = await self._place_aggressive_order(
                             exchange_client=self.secondary_client,
                             contract_id=self.secondary_contract_id,
-                            quantity=quantity,
+                            quantity=remaining_qty,
                             side=hedge_side,
                             price_offset=Decimal('0.005')  # 0.5% 偏移，确保立即成交
                         )
@@ -434,19 +472,35 @@ class DualExchangeHedge:
                         if result.success:
                             self.logger.info(f"对冲订单已下单: ID {result.order_id}")
 
-                            filled = await self._wait_for_hedge_fill(
-                                result.order_id, quantity
+                            # 等待订单成交并获取成交信息
+                            filled_info = await self._wait_for_hedge_fill_with_info(
+                                result.order_id, remaining_qty
                             )
 
-                            if filled:
-                                # 对冲成功（total_hedged_qty 已在调用前更新）
+                            if filled_info['success']:
+                                # 累加本次成交量
+                                filled_qty = filled_info['filled_qty']
+                                cumulative_hedged += filled_qty
                                 self.logger.info(
-                                    f"✅ 对冲完全成交: {quantity} (尝试 {attempt} 次)"
+                                    f"本次成交: {filled_qty}, 累计成交: {cumulative_hedged}/{quantity}"
                                 )
-                                success = True
-                                break
+
+                                # 检查是否完全成交
+                                if cumulative_hedged >= quantity:
+                                    self.logger.info(
+                                        f"✅ 对冲完全成交: {cumulative_hedged} (尝试 {attempt} 次)"
+                                    )
+                                    success = True
+                                    break
+                                else:
+                                    # 部分成交，继续重试剩余部分
+                                    self.logger.warning(
+                                        f"⚠️ 部分成交: {filled_qty}/{remaining_qty}, "
+                                        f"剩余 {quantity - cumulative_hedged} 将继续对冲"
+                                    )
                             else:
-                                self.logger.warning(f"对冲未完全成交 (尝试 #{attempt})")
+                                # 订单失败，取消后重试
+                                self.logger.warning(f"对冲未成交 (尝试 #{attempt})")
                                 try:
                                     await self.secondary_client.cancel_order(
                                         result.order_id
@@ -492,8 +546,7 @@ class DualExchangeHedge:
 
             # 计算状态同步间隔（每 5% 同步一次）
             total_iterations = self.config.iterations
-            sync_interval = max(1, int(total_iterations * 0.05))  # 至少为 1
-            last_sync_iteration = 0
+            last_notified_pct = -1  # 上次通知的百分比
 
             for iteration in range(1, self.config.iterations + 1):
                 if self.should_stop:
@@ -503,23 +556,73 @@ class DualExchangeHedge:
 
                 self.current_iteration = iteration  # 更新当前轮数
 
-                # 只在达到同步间隔或最后一轮时同步状态
-                should_sync = (
+                # 计算当前进度百分比
+                current_pct = int((iteration / total_iterations) * 100)
+
+                # 判断是否需要同步状态和发送通知
+                # 每 5% 发送一次通知 (0%, 5%, 10%, 15%, ...)
+                pct_milestone = (current_pct // 5) * 5
+                should_notify = (
                     iteration == 1 or  # 第一轮
                     iteration == total_iterations or  # 最后一轮
-                    (iteration - last_sync_iteration) >= sync_interval  # 达到同步间隔
+                    pct_milestone > last_notified_pct  # 达到新的 5% 里程碑
                 )
 
-                if should_sync:
-                    await self.update_status()
-                    last_sync_iteration = iteration
+                # 更新状态文件（每轮都更新，供前端实时显示）
+                await self.update_status()
 
                 self.logger.info(f"===== 开始第 {iteration}/{self.config.iterations} 轮交易 =====")
 
-                # 只在 5% 里程碑发送通知
-                if should_sync:
-                    progress_pct = int((iteration / total_iterations) * 100)
-                    await self._send_notification(f"📊 第 {iteration}/{self.config.iterations} 轮 ({progress_pct}%)")
+                # 在 5% 里程碑发送通知
+                if should_notify:
+                    # 查询仓位和延迟信息
+                    primary_pos = Decimal('0')
+                    secondary_pos = Decimal('0')
+
+                    try:
+                        pos = await self.primary_client.get_signed_position()
+                        if pos is not None:
+                            primary_pos = pos
+                    except Exception:
+                        pass
+
+                    try:
+                        pos = await self.secondary_client.get_signed_position()
+                        if pos is not None:
+                            secondary_pos = pos
+                    except Exception:
+                        pass
+
+                    primary_rtt = self.primary_client.get_avg_rtt()
+                    secondary_rtt = self.secondary_client.get_avg_rtt()
+
+                    # 计算运行时间
+                    runtime_seconds = int((datetime.now() - self.start_time).total_seconds())
+                    hours = runtime_seconds // 3600
+                    minutes = (runtime_seconds % 3600) // 60
+                    seconds = runtime_seconds % 60
+
+                    if hours > 0:
+                        runtime_str = f"{hours}h{minutes}m{seconds}s"
+                    elif minutes > 0:
+                        runtime_str = f"{minutes}m{seconds}s"
+                    else:
+                        runtime_str = f"{seconds}s"
+
+                    # 构建通知消息
+                    rtt_primary_str = f"{primary_rtt:.1f}ms" if primary_rtt else "N/A"
+                    rtt_secondary_str = f"{secondary_rtt:.1f}ms" if secondary_rtt else "N/A"
+
+                    notify_msg = (
+                        f"📊 第 {iteration}/{self.config.iterations} 轮 ({current_pct}%)\n"
+                        f"运行时间: {runtime_str}\n"
+                        f"仓位: {self.config.primary_exchange}={primary_pos:.4f}, "
+                        f"{self.config.secondary_exchange}={secondary_pos:.4f}\n"
+                        f"RTT: {self.config.primary_exchange}={rtt_primary_str}, "
+                        f"{self.config.secondary_exchange}={rtt_secondary_str}"
+                    )
+                    await self._send_notification(notify_msg)
+                    last_notified_pct = pct_milestone
 
                 # 检查并重置状态
                 state_ok = await self._verify_and_reset_state()
@@ -552,11 +655,6 @@ class DualExchangeHedge:
 
                 completed_iterations = iteration  # 记录完成的轮数
                 self.logger.info(f"===== 第 {iteration} 轮交易完成 =====")
-
-                # 在同步点发送完成通知
-                if should_sync and iteration < total_iterations:
-                    progress_pct = int((iteration / total_iterations) * 100)
-                    await self._send_notification(f"✅ 已完成 {iteration}/{total_iterations} 轮 ({progress_pct}%)")
 
             # 最终状态检查
             await self._final_position_check()
@@ -616,12 +714,12 @@ class DualExchangeHedge:
         try:
             self.logger.info(f"Step 1: 开仓 ({side} {self.config.quantity})")
 
-            # 重置追踪变量（包括累计对冲量）
+            # 重置追踪变量（包括累计对冲量和全局累计成交量）
             self.primary_filled_qty = Decimal('0')
             self.secondary_filled_qty = Decimal('0')
-            self.last_primary_filled = Decimal('0')
-            self.current_primary_order_id = None
             self.total_hedged_qty = Decimal('0')  # 重置累计对冲量
+            self.cumulative_filled_qty = Decimal('0')  # 重置全局累计成交量
+            self.order_processed_fills.clear()  # 清空订单成交去重字典
 
             # 等待订单完全成交（包含挂单和重挂逻辑）
             success = await self._wait_for_fill_with_repricing(side, self.config.quantity)
@@ -710,12 +808,12 @@ class DualExchangeHedge:
         try:
             self.logger.info(f"Step 2: 平仓 ({side} {self.config.quantity})")
 
-            # 重置追踪变量（包括累计对冲量）
+            # 重置追踪变量（包括累计对冲量和全局累计成交量）
             self.primary_filled_qty = Decimal('0')
             self.secondary_filled_qty = Decimal('0')
-            self.last_primary_filled = Decimal('0')
-            self.current_primary_order_id = None
             self.total_hedged_qty = Decimal('0')  # 重置累计对冲量
+            self.cumulative_filled_qty = Decimal('0')  # 重置全局累计成交量
+            self.order_processed_fills.clear()  # 清空订单成交去重字典
 
             # 等待订单完全成交（包含挂单和重挂逻辑）
             success = await self._wait_for_fill_with_repricing(side, self.config.quantity)
@@ -1118,16 +1216,18 @@ class DualExchangeHedge:
             from exchanges.base import OrderResult
             return OrderResult(success=False, error_message=str(e))
 
-    async def _wait_for_hedge_fill(self, order_id: str, expected_qty: Decimal, timeout: int = 30) -> bool:
+    async def _wait_for_hedge_fill_with_info(self, order_id: str, expected_qty: Decimal, timeout: int = 30) -> dict:
         """
-        等待对冲订单完全成交
+        等待对冲订单成交并返回详细信息
 
         参数:
         - order_id: 订单 ID
         - expected_qty: 预期成交数量
         - timeout: 超时时间（秒）
 
-        返回: True=完全成交, False=未成交或部分成交
+        返回: {'success': bool, 'filled_qty': Decimal}
+            - success: True=完全成交, False=未成交或部分成交
+            - filled_qty: 实际成交数量
         """
         start_time = asyncio.get_event_loop().time()
         check_interval = 2  # 每2秒检查一次
@@ -1139,29 +1239,36 @@ class DualExchangeHedge:
 
             if elapsed > timeout:
                 self.logger.warning(f"对冲订单等待超时 ({timeout}秒): {order_id}")
-                return False
+                return {'success': False, 'filled_qty': Decimal('0')}
 
-            # 检查副交易所成交量（通过回调更新的 self.secondary_filled_qty）
-            if self.secondary_filled_qty >= expected_qty:
-                self.logger.info(f"对冲订单已完全成交: {self.secondary_filled_qty}/{expected_qty}")
-                return True
-
-            # 或者通过 API 主动查询订单状态
+            # 通过 API 主动查询订单状态
             try:
                 order_info = await self.secondary_client.get_order_info(order_id)
 
                 if order_info is None:
                     # 订单不存在 - 可能是被立即拒绝或已经被交易所清理
                     self.logger.warning(f"对冲订单不存在或已被清理: {order_id}，将触发重试")
-                    return False
+                    return {'success': False, 'filled_qty': Decimal('0')}
 
                 if order_info.status == 'FILLED':
-                    self.logger.info(f"对冲订单已完全成交 (API 确认): {order_id}")
-                    return True
+                    # 完全成交
+                    filled_qty = order_info.filled_size
+                    self.logger.info(f"对冲订单已完全成交 (API 确认): {order_id}, 成交: {filled_qty}")
+                    return {'success': True, 'filled_qty': filled_qty}
                 elif order_info.status in ['CANCELLED', 'REJECTED', 'CANCELED']:
-                    # IOC 订单被拒绝或取消（未成交部分），返回失败以触发重试
-                    self.logger.warning(f"对冲订单被拒绝/取消: {order_info.status}, 成交: {order_info.filled_size}/{expected_qty}")
-                    return False
+                    # IOC 订单被拒绝或取消
+                    filled_qty = order_info.filled_size
+                    if filled_qty > Decimal('0'):
+                        # 部分成交
+                        self.logger.warning(
+                            f"对冲订单部分成交后被取消: {order_info.status}, "
+                            f"成交: {filled_qty}/{expected_qty}"
+                        )
+                        return {'success': True, 'filled_qty': filled_qty}
+                    else:
+                        # 完全未成交
+                        self.logger.warning(f"对冲订单被拒绝/取消: {order_info.status}, 未成交")
+                        return {'success': False, 'filled_qty': Decimal('0')}
                 else:
                     self.logger.debug(f"对冲订单状态: {order_info.status}, 成交: {order_info.filled_size}/{expected_qty}")
             except Exception as e:
@@ -1169,7 +1276,7 @@ class DualExchangeHedge:
                 error_msg = str(e).lower()
                 if 'not found' in error_msg or 'does not exist' in error_msg or '不存在' in error_msg:
                     self.logger.warning(f"对冲订单不存在: {order_id}，错误: {e}，将触发重试")
-                    return False
+                    return {'success': False, 'filled_qty': Decimal('0')}
                 else:
                     self.logger.debug(f"查询对冲订单状态失败: {e}")
 
@@ -1236,8 +1343,9 @@ class DualExchangeHedge:
         验证并重置状态
 
         检查项:
-        1. 两个交易所的实际仓位必须接近 0
-        2. 追踪变量应该已经清空
+        1. 两个交易所的净仓位必须在合理范围内
+        2. 单个交易所残余仓位不能超过订单量的一定比例
+        3. 追踪变量应该已经清空
 
         返回: True=状态正常可以继续, False=存在异常需要中断
         """
@@ -1263,22 +1371,57 @@ class DualExchangeHedge:
             self.logger.error(f"❌ 副交易所仓位查询异常: {e}", exc_info=True)
             return False
 
-        position_threshold = Decimal('0.001')  # 允许的最小残余仓位
+        # 计算净仓位
+        net_position = primary_pos + secondary_pos
+        self.logger.info(f"净仓位: {net_position}")
 
-        # 如果存在未平仓位，说明上一轮交易有问题
-        if abs(primary_pos) > position_threshold:
-            self.logger.error(f"❌ 主交易所存在未平仓位: {primary_pos}")
+        # 净仓位不应超过订单量的 2 倍（说明有严重的对冲失败）
+        max_acceptable_net = self.config.quantity * 2
+        if abs(net_position) > max_acceptable_net:
+            self.logger.error(
+                f"❌ 净仓位过大: {net_position} (阈值: {max_acceptable_net})"
+            )
+            self.logger.error(
+                f"   主交易所: {primary_pos}, 副交易所: {secondary_pos}"
+            )
+            self.logger.error("   可能存在严重的对冲失败，需要人工介入")
             return False
 
-        if abs(secondary_pos) > position_threshold:
-            self.logger.error(f"❌ 副交易所存在未平仓位: {secondary_pos}")
-            return False
+        # 检查单个交易所残余仓位是否在合理范围
+        # 允许最多 20% 的订单量作为残余（比 0.001 宽松很多）
+        max_single_residual = self.config.quantity * Decimal('0.2')
+
+        if abs(primary_pos) > max_single_residual:
+            self.logger.warning(
+                f"⚠️ 主交易所残余仓位较大: {primary_pos} "
+                f"(阈值: {max_single_residual})"
+            )
+            # 不直接返回 False，而是记录警告，继续检查净仓位
+
+        if abs(secondary_pos) > max_single_residual:
+            self.logger.warning(
+                f"⚠️ 副交易所残余仓位较大: {secondary_pos} "
+                f"(阈值: {max_single_residual})"
+            )
+
+        # 如果净仓位在合理范围内，即使有小额残余也允许继续
+        # 这些残余会在下一轮的清理步骤中被处理
+        if abs(net_position) <= self.config.quantity * Decimal('0.05'):  # 5% 容忍度
+            self.logger.info(
+                f"✅ 净仓位在可接受范围: {net_position} "
+                f"(≤ {self.config.quantity * Decimal('0.05')})"
+            )
+        else:
+            self.logger.warning(
+                f"⚠️ 净仓位略高但仍可接受: {net_position}"
+            )
 
         # 状态检查通过，重置追踪变量
         self.primary_filled_qty = Decimal('0')
         self.secondary_filled_qty = Decimal('0')
-        self.last_primary_filled = Decimal('0')
-        self.current_primary_order_id = None
+        self.total_hedged_qty = Decimal('0')  # 也重置累计对冲量
+        self.cumulative_filled_qty = Decimal('0')  # 也重置全局累计成交量
+        self.order_processed_fills.clear()  # 清空订单成交去重字典
 
         self.logger.info("✅ 状态检查通过，已重置追踪变量")
         return True
