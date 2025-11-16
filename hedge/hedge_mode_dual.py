@@ -116,6 +116,7 @@ class DualExchangeHedge:
         self.secondary_filled_qty = Decimal('0')
         self.last_primary_filled = Decimal('0')
         self.current_primary_order_id: Optional[str] = None
+        self.total_hedged_qty = Decimal('0')  # 累计已对冲数量（防止重复对冲）
 
         # 控制标志
         self.is_running = False
@@ -277,11 +278,13 @@ class DualExchangeHedge:
         核心逻辑:
             1. 检测订单 ID 变化，识别新订单或同一订单
             2. 计算增量成交（仅对新增成交量进行对冲）
-            3. 触发副交易所对冲
+            3. 使用 total_hedged_qty 防止重复对冲
+            4. 触发副交易所对冲
 
-        增量成交计算:
-            - 新订单: 重置 last_filled，全部成交量算增量
+        防重复对冲机制:
+            - 新订单: 重置 last_filled 为 0
             - 同一订单: 增量 = 当前累计 - 上次累计
+            - 关键保护: 只有当 filled_qty > total_hedged_qty 时才触发对冲
         """
         try:
             self.logger.debug(f"收到主交易所订单更新: {order_data}")
@@ -293,7 +296,7 @@ class DualExchangeHedge:
             order_id = order_data.get('order_id')
             filled_qty = Decimal(str(order_data.get('filled_size', 0)))
 
-            # 检测订单切换并计算增量成交
+            # 检测订单切换
             if order_id != self.current_primary_order_id:
                 self.logger.info(
                     f"🆕 检测到新订单: {order_id} "
@@ -301,27 +304,41 @@ class DualExchangeHedge:
                 )
                 self.current_primary_order_id = order_id
                 self.last_primary_filled = Decimal('0')
-                incremental_fill = filled_qty
-            else:
-                incremental_fill = filled_qty - self.last_primary_filled
+
+            # 计算增量成交
+            incremental_fill = filled_qty - self.last_primary_filled
 
             self.logger.info(
                 f"订单 {order_id} 成交更新: 累计={filled_qty}, "
-                f"增量={incremental_fill} (上次={self.last_primary_filled})"
+                f"增量={incremental_fill} (上次={self.last_primary_filled}), "
+                f"已对冲={self.total_hedged_qty}"
             )
 
-            if incremental_fill > Decimal('0'):
+            # 防重复对冲：只有当累计成交量大于已对冲量时才触发
+            if filled_qty > self.total_hedged_qty and incremental_fill > Decimal('0'):
+                # 实际需要对冲的量 = 累计成交 - 已对冲
+                actual_hedge_qty = filled_qty - self.total_hedged_qty
+
                 self.logger.info(f"主交易所新增成交: {incremental_fill}")
+                self.logger.info(f"实际需要对冲: {actual_hedge_qty}")
+
                 self.last_primary_filled = filled_qty
                 self.primary_filled_qty = filled_qty
 
+                # 立即更新累计对冲量（防止竞态条件）
+                # 在对冲执行之前更新，避免并发的 WebSocket 消息导致重复对冲
+                self.total_hedged_qty = filled_qty
+
                 self.logger.info(f"触发对冲，方向: {order_data.get('side')}")
-                await self._execute_hedge(incremental_fill, order_data.get('side'))
+                await self._execute_hedge(actual_hedge_qty, order_data.get('side'))
                 self.logger.info("对冲执行完毕")
 
                 await self.update_status()
             else:
-                self.logger.debug(f"无新增成交: {incremental_fill}")
+                self.logger.debug(
+                    f"无需对冲: incremental={incremental_fill}, "
+                    f"filled={filled_qty}, hedged={self.total_hedged_qty}"
+                )
 
         except Exception as e:
             self.logger.error(f"处理主交易所订单更新失败: {e}", exc_info=True)
@@ -363,6 +380,7 @@ class DualExchangeHedge:
             - 主交易所买入 → 副交易所卖出
             - 主交易所卖出 → 副交易所买入
             - 使用 IOC 市价单确保快速成交
+            - 成功后更新 total_hedged_qty 防止重复对冲
 
         重试机制:
             - 30 秒内持续重试
@@ -421,6 +439,7 @@ class DualExchangeHedge:
                             )
 
                             if filled:
+                                # 对冲成功（total_hedged_qty 已在调用前更新）
                                 self.logger.info(
                                     f"✅ 对冲完全成交: {quantity} (尝试 {attempt} 次)"
                                 )
@@ -597,11 +616,12 @@ class DualExchangeHedge:
         try:
             self.logger.info(f"Step 1: 开仓 ({side} {self.config.quantity})")
 
-            # 重置追踪变量
+            # 重置追踪变量（包括累计对冲量）
             self.primary_filled_qty = Decimal('0')
             self.secondary_filled_qty = Decimal('0')
             self.last_primary_filled = Decimal('0')
             self.current_primary_order_id = None
+            self.total_hedged_qty = Decimal('0')  # 重置累计对冲量
 
             # 等待订单完全成交（包含挂单和重挂逻辑）
             success = await self._wait_for_fill_with_repricing(side, self.config.quantity)
@@ -690,11 +710,12 @@ class DualExchangeHedge:
         try:
             self.logger.info(f"Step 2: 平仓 ({side} {self.config.quantity})")
 
-            # 重置追踪变量
+            # 重置追踪变量（包括累计对冲量）
             self.primary_filled_qty = Decimal('0')
             self.secondary_filled_qty = Decimal('0')
             self.last_primary_filled = Decimal('0')
             self.current_primary_order_id = None
+            self.total_hedged_qty = Decimal('0')  # 重置累计对冲量
 
             # 等待订单完全成交（包含挂单和重挂逻辑）
             success = await self._wait_for_fill_with_repricing(side, self.config.quantity)
