@@ -130,6 +130,9 @@ class DualExchangeHedge:
         self.hedge_completed_event = asyncio.Event()
         self.hedge_in_progress = False
 
+        # WebSocket 事件（用于订单取消确认）
+        self.primary_order_canceled_event = asyncio.Event()
+
         # 任务状态
         self.task_id = config.task_id
         self.current_iteration = 0
@@ -285,19 +288,35 @@ class DualExchangeHedge:
             3. 只对真正的新增成交进行对冲
             4. 立即更新已处理成交和累计对冲量（防止竞态条件）
 
+        订单取消事件处理:
+            - 监听 CANCELED/CANCELLED 状态
+            - 触发 primary_order_canceled_event 事件
+            - 支持事件驱动的订单取消确认（替代轮询）
+
         这种设计确保：
             - 防止 WebSocket 消息乱序或重复导致的重复对冲
             - 即使订单被取消重挂，也能正确追踪每个订单的成交
             - A 实际成交多少，B 就对冲多少
+            - 订单取消确认延迟低（WebSocket 推送 vs 轮询）
         """
         try:
             self.logger.debug(f"收到主交易所订单更新: {order_data}")
 
+            order_id = order_data.get('order_id')
+            status = order_data.get('status')
+
+            # ✅ 处理订单取消事件（事件驱动，替代轮询）
+            if status in ['CANCELED', 'CANCELLED']:
+                self.logger.info(f"📨 WebSocket: 订单 {order_id} 已取消")
+                # 如果是当前追踪的订单，触发取消事件
+                if order_id == self.current_primary_order_id:
+                    self.primary_order_canceled_event.set()
+                    self.logger.info(f"✅ 已触发取消事件 (order_id={order_id})")
+
             if self.disable_hedging:
-                self.logger.debug("对冲已禁用，跳过处理")
+                self.logger.debug("对冲已禁用，跳过成交处理")
                 return
 
-            order_id = order_data.get('order_id')
             filled_qty = Decimal(str(order_data.get('filled_size', 0)))
 
             # 获取该订单已处理的成交量（默认为 0）
@@ -972,9 +991,19 @@ class DualExchangeHedge:
                         # 如果价格不是最优，取消重挂
                         if abs(current_price - optimal_price) > self.primary_client.config.tick_size / 10:
                             self.logger.info(f"价格不再最优 (当前: {current_price}, 最优: {optimal_price})，取消重挂")
-                            await self.primary_client.cancel_order(self.current_primary_order_id)
-                            self.current_primary_order_id = None
-                            # 循环会自动重新下单
+
+                            # ✅ 确保旧订单成功取消后再重挂
+                            cancel_success = await self._cancel_order_with_verification(
+                                self.current_primary_order_id
+                            )
+
+                            if cancel_success:
+                                self.logger.info(f"✅ 订单 {self.current_primary_order_id} 已成功取消")
+                                self.current_primary_order_id = None
+                                # 循环会自动重新下单
+                            else:
+                                self.logger.warning(f"⚠️ 订单 {self.current_primary_order_id} 取消失败或未完全取消，等待下次检查")
+                                # 保留 current_primary_order_id，下次循环继续尝试取消
                         else:
                             self.logger.debug(f"价格仍是最优: {current_price}")
                     else:
@@ -1018,6 +1047,78 @@ class DualExchangeHedge:
                 self.logger.info(f"已取消超时订单: {self.current_primary_order_id}")
             except Exception as e:
                 self.logger.error(f"取消订单失败: {e}")
+
+    async def _cancel_order_with_verification(self, order_id: str, timeout: float = 5.0) -> bool:
+        """
+        取消订单并通过 WebSocket 事件验证取消成功（事件驱动方式）
+
+        优化策略:
+            1. 调用 cancel_order API
+            2. 等待 WebSocket 推送取消确认事件（带超时）
+            3. 超时后进行一次轮询验证作为 fallback
+            4. 比轮询方式更快、更可靠
+
+        参数:
+            order_id: 要取消的订单 ID
+            timeout: 等待 WebSocket 确认的超时时间（秒），默认 5.0
+
+        返回:
+            True: 订单已成功取消（通过 WebSocket 或轮询确认）
+            False: 取消失败，订单仍处于活跃状态
+
+        设计优势:
+            - WebSocket 推送确认延迟低（通常 < 100ms）
+            - 避免多次轮询的延迟和 API 调用开销
+            - 仍保留轮询 fallback 确保可靠性
+        """
+        try:
+            # 清除之前的事件状态
+            self.primary_order_canceled_event.clear()
+
+            self.logger.info(f"尝试取消订单 {order_id}")
+
+            # 步骤1: 调用取消 API
+            await self.primary_client.cancel_order(order_id)
+
+            # 步骤2: 等待 WebSocket 确认取消（带超时）
+            try:
+                await asyncio.wait_for(
+                    self.primary_order_canceled_event.wait(),
+                    timeout=timeout
+                )
+                self.logger.info(f"✅ 订单 {order_id} 已通过 WebSocket 确认取消")
+                return True
+
+            except asyncio.TimeoutError:
+                self.logger.warning(f"⚠️ 等待订单 {order_id} WebSocket 取消确认超时 ({timeout}s)")
+
+                # 步骤3: 超时后进行一次轮询验证（fallback）
+                self.logger.info(f"执行轮询验证作为 fallback...")
+                order_info = await self.primary_client.get_order_info(order_id)
+
+                if order_info is None:
+                    self.logger.info(f"订单 {order_id} 已不存在，视为取消成功")
+                    return True
+
+                if order_info.status in ['CANCELLED', 'CANCELED', 'REJECTED']:
+                    self.logger.info(f"订单 {order_id} 已取消，状态: {order_info.status}（轮询确认）")
+                    return True
+
+                if order_info.status == 'FILLED':
+                    self.logger.info(f"订单 {order_id} 在取消前已成交（轮询确认）")
+                    return True
+
+                if order_info.status in ['OPEN', 'PENDING']:
+                    self.logger.error(f"❌ 订单 {order_id} 取消失败，状态仍为 {order_info.status}")
+                    return False
+
+                # 未知状态
+                self.logger.warning(f"⚠️ 订单 {order_id} 状态未知: {order_info.status}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"取消订单 {order_id} 时发生错误: {e}")
+            return False
 
     async def _cleanup_residual_positions(self):
         """
