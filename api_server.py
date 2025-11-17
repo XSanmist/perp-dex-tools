@@ -157,6 +157,10 @@ class ProcessInfo(BaseModel):
     # RTT information (Round-Trip Time in milliseconds)
     primary_rtt_ms: Optional[float] = None
     secondary_rtt_ms: Optional[float] = None
+    # Trading volume and P&L information
+    total_volume_usd: Optional[float] = None
+    total_pnl: Optional[float] = None
+    cost_per_10k_usd: Optional[float] = None
 
 
 # ==================== Global State ====================
@@ -466,6 +470,11 @@ async def list_processes(api_key: str = Depends(verify_api_key)):
             # RTT information
             info_dict['primary_rtt_ms'] = status.get('primary_rtt_ms')
             info_dict['secondary_rtt_ms'] = status.get('secondary_rtt_ms')
+
+            # Trading volume and P&L information
+            info_dict['total_volume_usd'] = status.get('total_volume_usd')
+            info_dict['total_pnl'] = status.get('total_pnl')
+            info_dict['cost_per_10k_usd'] = status.get('cost_per_10k_usd')
 
         result[task_id] = ProcessInfo(**info_dict)
 

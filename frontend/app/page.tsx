@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { NewTaskDialog } from "@/components/NewTaskDialog";
 import { ApiKeyDialog } from "@/components/ApiKeyDialog";
+import { StatsCard } from "@/components/StatsCard";
+import { NetworkLatencyCard, TradingPerformanceCard, PositionsCard } from "@/components/TaskStats";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -18,30 +20,13 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-
-interface Process {
-  id: string;
-  pid: number;
-  command: string;
-  start_time: string;
-  status: string;
-  name: string;
-  exchange?: string;
-  ticker?: string;
-  current_iteration?: number;
-  total_iterations?: number;
-  primary_position?: number;
-  secondary_position?: number;
-  primary_exchange?: string;
-  secondary_exchange?: string;
-  runtime_seconds?: number;
-  primary_rtt_ms?: number | null;
-  secondary_rtt_ms?: number | null;
-}
+import { Process, useSelectedTask, usePositionDelta, useHasRttData, useHasTradingData } from "@/hooks/useSelectedTask";
+import { formatRuntime, calculateRuntime, formatProgress } from "@/lib/formatters";
 
 export default function Home() {
+  // State
   const [tasks, setTasks] = useState<Process[]>([]);
-  const [selectedTask, setSelectedTask] = useState<number | null>(null);
+  const [selectedTaskPid, setSelectedTaskPid] = useState<number | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [autoScroll, setAutoScroll] = useState(true);
   const [loading, setLoading] = useState(true);
@@ -50,9 +35,17 @@ export default function Home() {
   const [taskToStop, setTaskToStop] = useState<{ id: string; name: string } | null>(null);
   const [error, setError] = useState<{ title: string; message: string } | null>(null);
   const [, setCurrentTime] = useState(Date.now()); // 用于触发运行时间的更新
+
+  // Refs
   const logsEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const currentTaskIdRef = useRef<string | null>(null); // 跟踪当前连接的任务 ID
+
+  // Derived state from hooks
+  const selectedTask = useSelectedTask(tasks, selectedTaskPid);
+  const positionDelta = usePositionDelta(selectedTask);
+  const hasRttData = useHasRttData(selectedTask);
+  const hasTradingData = useHasTradingData(selectedTask);
 
   // 获取 API Key
   const getApiKey = () => {
@@ -151,14 +144,17 @@ export default function Home() {
             runtime_seconds: info.runtime_seconds,
             primary_rtt_ms: info.primary_rtt_ms,
             secondary_rtt_ms: info.secondary_rtt_ms,
+            total_volume_usd: info.total_volume_usd,
+            total_pnl: info.total_pnl,
+            cost_per_10k_usd: info.cost_per_10k_usd,
           };
         });
 
         setTasks(processList);
 
         // 如果有任务且没有选中的，选中第一个
-        if (processList.length > 0 && !selectedTask) {
-          setSelectedTask(processList[0].pid);
+        if (processList.length > 0 && !selectedTaskPid) {
+          setSelectedTaskPid(processList[0].pid);
         }
       } else {
         await handleApiError(response, 'Failed to fetch task list', true);
@@ -250,8 +246,8 @@ export default function Home() {
 
         // 如果停止的是当前选中的任务，清除选中状态
         const stoppedTask = tasks.find(t => t.id === taskId);
-        if (stoppedTask && selectedTask === stoppedTask.pid) {
-          setSelectedTask(null);
+        if (stoppedTask && selectedTaskPid === stoppedTask.pid) {
+          setSelectedTaskPid(null);
           setLogs([]);
         }
       } else {
@@ -359,14 +355,11 @@ export default function Home() {
 
   // 当选中任务改变时，建立 WebSocket 连接获取实时日志
   useEffect(() => {
-    if (selectedTask && tasks.length > 0) {
-      const task = tasks.find(t => t.pid === selectedTask);
-      if (task && task.id) {
-        // 只有当任务 ID 实际改变时才重新连接
-        if (currentTaskIdRef.current !== task.id) {
-          currentTaskIdRef.current = task.id;
-          connectWebSocket(task.id);
-        }
+    if (selectedTask && selectedTask.id) {
+      // 只有当任务 ID 实际改变时才重新连接
+      if (currentTaskIdRef.current !== selectedTask.id) {
+        currentTaskIdRef.current = selectedTask.id;
+        connectWebSocket(selectedTask.id);
       }
     } else {
       // 如果取消选择，关闭 WebSocket 连接
@@ -406,32 +399,6 @@ export default function Home() {
     if (log.includes("[WARN]")) return "text-yellow-400";
     if (log.includes("[SUCCESS]")) return "text-green-400";
     return "text-gray-300";
-  }
-
-  // 计算任务运行时间（秒）
-  // startTime 格式: "2025-11-08T06:09:50.225285Z" (UTC时间，带Z后缀)
-  // JavaScript 会自动将 UTC 时间转换为本地时间进行计算
-  function calculateRuntime(startTime: string): number {
-    const start = new Date(startTime); // 解析 UTC 时间
-    const now = new Date(); // 当前本地时间
-    // 计算时间差（毫秒），与时区无关
-    return Math.floor((now.getTime() - start.getTime()) / 1000);
-  }
-
-  // 格式化运行时间显示
-  function formatRuntime(seconds?: number): string {
-    if (!seconds) return "0s";
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-
-    if (hours > 0) {
-      return `${hours}h ${minutes}m ${secs}s`;
-    } else if (minutes > 0) {
-      return `${minutes}m ${secs}s`;
-    } else {
-      return `${secs}s`;
-    }
   }
 
   // 获取任务的运行时间
@@ -488,11 +455,11 @@ export default function Home() {
                       key={task.id}
                       className={cn(
                         "bg-secondary border cursor-pointer transition-all hover:bg-secondary/80",
-                        selectedTask === task.pid
+                        selectedTaskPid === task.pid
                           ? "border-primary bg-secondary/80"
                           : "border-gray-700"
                       )}
-                      onClick={() => setSelectedTask(task.pid)}
+                      onClick={() => setSelectedTaskPid(task.pid)}
                     >
                       <CardContent className="p-4">
                         <div className="flex items-center justify-between mb-2">
@@ -565,124 +532,38 @@ export default function Home() {
           <div className="lg:col-span-2 flex flex-col" style={{ height: 'calc(100vh - 8rem)' }}>
             {/* Stats Cards */}
             <div className="grid grid-cols-3 gap-4 mb-6 flex-shrink-0">
-              <Card className="bg-card border-gray-800">
-                <CardContent className="p-4">
-                  <div className="text-sm text-gray-400 mb-1">Runtime</div>
-                  <div className="text-2xl font-bold text-white">
-                    {selectedTask
-                      ? (() => {
-                          const task = tasks.find(t => t.pid === selectedTask);
-                          return task ? getTaskRuntime(task) : "0s";
-                        })()
-                      : "0s"}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Current session</div>
-                </CardContent>
-              </Card>
-              <Card className="bg-card border-gray-800">
-                <CardContent className="p-4">
-                  <div className="text-sm text-gray-400 mb-1">Progress</div>
-                  <div className="text-2xl font-bold text-white">
-                    {selectedTask
-                      ? (() => {
-                          const task = tasks.find(t => t.pid === selectedTask);
-                          if (task?.current_iteration !== undefined && task?.total_iterations !== undefined) {
-                            return `${task.current_iteration}/${task.total_iterations}`;
-                          }
-                          return "N/A";
-                        })()
-                      : "N/A"}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    {selectedTask
-                      ? (() => {
-                          const task = tasks.find(t => t.pid === selectedTask);
-                          if (task?.current_iteration !== undefined && task?.total_iterations !== undefined) {
-                            const percentage = ((task.current_iteration / task.total_iterations) * 100).toFixed(1);
-                            return `${percentage}% complete`;
-                          }
-                          return "Waiting...";
-                        })()
-                      : "Select a task"}
-                  </div>
-                </CardContent>
-              </Card>
-              <Card className={(() => {
-                const task = tasks.find(t => t.pid === selectedTask);
-                // Calculate delta
-                if (task?.primary_position !== undefined && task?.secondary_position !== undefined) {
-                  const delta = (task.primary_position ?? 0) + (task.secondary_position ?? 0);
-                  return delta !== 0 ? "bg-card border-red-500" : "bg-card border-gray-800";
+              <StatsCard
+                title="Runtime"
+                value={selectedTask ? getTaskRuntime(selectedTask) : "0s"}
+                subtitle="Current session"
+              />
+              <StatsCard
+                title="Progress"
+                value={
+                  selectedTask?.current_iteration !== undefined && selectedTask?.total_iterations !== undefined
+                    ? `${selectedTask.current_iteration}/${selectedTask.total_iterations}`
+                    : "N/A"
                 }
-                return "bg-card border-gray-800";
-              })()}>
-                <CardContent className="p-4">
-                  <div className="text-sm text-gray-400 mb-1">Positions</div>
-                  <div className="text-lg font-bold text-white">
-                    {selectedTask
-                      ? (() => {
-                          const task = tasks.find(t => t.pid === selectedTask);
-                          // Position display
-                          if (task?.primary_position !== undefined && task?.secondary_position !== undefined) {
-                            const delta = (task.primary_position ?? 0) + (task.secondary_position ?? 0);
-                            return (
-                              <div className="space-y-1">
-                                <div className="flex justify-between text-sm">
-                                  <span className="text-gray-400">{task.primary_exchange || 'Primary'}:</span>
-                                  <span>{(task.primary_position ?? 0).toFixed(4)}</span>
-                                </div>
-                                <div className="flex justify-between text-sm">
-                                  <span className="text-gray-400">{task.secondary_exchange || 'Secondary'}:</span>
-                                  <span>{(task.secondary_position ?? 0).toFixed(4)}</span>
-                                </div>
-                                <div className="flex justify-between text-sm border-t border-gray-700 pt-1 mt-1">
-                                  <span className="text-gray-400">Delta:</span>
-                                  <span className={delta !== 0 ? "text-red-400" : ""}>{delta.toFixed(4)}</span>
-                                </div>
-                              </div>
-                            );
-                          }
-                          return "N/A";
-                        })()
-                      : "N/A"}
-                  </div>
-                </CardContent>
-              </Card>
+                subtitle={
+                  selectedTask?.current_iteration !== undefined && selectedTask?.total_iterations !== undefined
+                    ? `${((selectedTask.current_iteration / selectedTask.total_iterations) * 100).toFixed(1)}% complete`
+                    : selectedTask ? "Waiting..." : "Select a task"
+                }
+              />
+              {selectedTask && positionDelta !== null ? (
+                <PositionsCard task={selectedTask} delta={positionDelta} />
+              ) : (
+                <StatsCard title="Positions" value="N/A" />
+              )}
             </div>
 
-            {/* RTT Stats */}
-            {selectedTask && (() => {
-              const task = tasks.find(t => t.pid === selectedTask);
-              if (task && (task.primary_rtt_ms !== undefined || task.secondary_rtt_ms !== undefined)) {
-                return (
-                  <div className="grid grid-cols-2 gap-4 mb-6 flex-shrink-0">
-                    {task.primary_rtt_ms !== undefined && task.primary_rtt_ms !== null && (
-                      <Card className="bg-card border-gray-800">
-                        <CardContent className="p-4">
-                          <div className="text-sm text-gray-400 mb-1">{task.primary_exchange || 'Primary'} RTT</div>
-                          <div className="text-2xl font-bold text-white">
-                            {task.primary_rtt_ms.toFixed(1)} ms
-                          </div>
-                          <div className="text-xs text-gray-500 mt-1">Average round-trip time</div>
-                        </CardContent>
-                      </Card>
-                    )}
-                    {task.secondary_rtt_ms !== undefined && task.secondary_rtt_ms !== null && (
-                      <Card className="bg-card border-gray-800">
-                        <CardContent className="p-4">
-                          <div className="text-sm text-gray-400 mb-1">{task.secondary_exchange || 'Secondary'} RTT</div>
-                          <div className="text-2xl font-bold text-white">
-                            {task.secondary_rtt_ms.toFixed(1)} ms
-                          </div>
-                          <div className="text-xs text-gray-500 mt-1">Average round-trip time</div>
-                        </CardContent>
-                      </Card>
-                    )}
-                  </div>
-                );
-              }
-              return null;
-            })()}
+            {/* RTT Stats and Trading Performance */}
+            {selectedTask && (hasRttData || hasTradingData) && (
+              <div className="grid grid-cols-2 gap-4 mb-6 flex-shrink-0">
+                {hasRttData && <NetworkLatencyCard task={selectedTask} />}
+                {hasTradingData && <TradingPerformanceCard task={selectedTask} />}
+              </div>
+            )}
 
             {/* Log Viewer */}
             <Card className="bg-card border-gray-800 flex-1 flex flex-col min-h-0">

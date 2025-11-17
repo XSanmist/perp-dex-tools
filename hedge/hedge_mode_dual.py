@@ -122,6 +122,21 @@ class DualExchangeHedge:
         # 格式: {order_id: 已处理的成交量}
         self.order_processed_fills: dict[str, Decimal] = {}
 
+        # 当前订单价格（用于计算交易量）
+        self.current_order_price: Optional[Decimal] = None
+
+        # P&L 统计
+        self.pnl_tracker = {
+            'initial_balance_primary': None,  # 初始余额（主交易所）
+            'initial_balance_secondary': None,  # 初始余额（副交易所）
+            'current_balance_primary': None,  # 当前余额（主交易所）
+            'current_balance_secondary': None,  # 当前余额（副交易所）
+            'pnl_primary': Decimal('0'),  # 主交易所盈亏
+            'pnl_secondary': Decimal('0'),  # 副交易所盈亏
+            'total_pnl': Decimal('0'),  # 总盈亏
+            'total_volume_usd': Decimal('0'),  # 总交易量（USDT）
+        }
+
         # 控制标志
         self.is_running = False
         self.should_stop = False
@@ -191,6 +206,13 @@ class DualExchangeHedge:
         if self.secondary_client:
             secondary_rtt = self.secondary_client.get_avg_rtt()
 
+        # 计算损耗率
+        total_volume = float(self.pnl_tracker['total_volume_usd'])
+        total_pnl = float(self.pnl_tracker['total_pnl'])
+        cost_per_10k = None
+        if total_volume >= 1:
+            cost_per_10k = round((abs(total_pnl) / total_volume) * 10000, 2)
+
         status_data[self.task_id] = {
             'current_iteration': self.current_iteration,
             'total_iterations': self.config.iterations,
@@ -201,6 +223,9 @@ class DualExchangeHedge:
             'runtime_seconds': runtime_seconds,
             'primary_rtt_ms': round(primary_rtt, 1) if primary_rtt is not None else None,
             'secondary_rtt_ms': round(secondary_rtt, 1) if secondary_rtt is not None else None,
+            'total_volume_usd': round(total_volume, 2) if total_volume > 0 else None,
+            'total_pnl': round(total_pnl, 2),
+            'cost_per_10k_usd': cost_per_10k,
         }
 
         try:
@@ -208,6 +233,188 @@ class DualExchangeHedge:
                 json.dump(status_data, f, indent=2)
         except Exception as e:
             self.logger.error(f"更新状态文件失败: {e}")
+
+    async def _fetch_account_info(self) -> tuple:
+        """
+        从交易所 API 查询账户信息（包含 P&L）
+
+        返回:
+            (primary_info, secondary_info)
+            每个 info 是一个字典: {
+                'balance': Decimal,  # 账户余额
+                'unrealized_pnl': Decimal,  # 未实现盈亏
+                'position': Decimal,  # 当前持仓
+            }
+        """
+        primary_info = {'balance': None, 'unrealized_pnl': Decimal('0'), 'position': Decimal('0')}
+        secondary_info = {'balance': None, 'unrealized_pnl': Decimal('0'), 'position': Decimal('0')}
+
+        try:
+            # 查询主交易所账户信息
+            if self.primary_client:
+                try:
+                    # 🔍 DEBUG: 打印完整的 API 响应数据
+                    self.logger.info(f"🔍 [DEBUG] 正在查询主交易所 ({self.config.primary_exchange}) 的账户信息...")
+
+                    # 如果是 GRVT，调用 get_account_summary 获取账户余额
+                    if hasattr(self.primary_client, 'rest_client'):
+                        try:
+                            # 获取账户摘要(包含余额、权益等信息)
+                            account_summary = self.primary_client.rest_client.get_account_summary(type="sub-account")
+
+                            if isinstance(account_summary, dict):
+                                # 提取关键字段
+                                primary_info['balance'] = Decimal(str(account_summary.get('total_equity', '0')))
+                                primary_info['unrealized_pnl'] = Decimal(str(account_summary.get('unrealized_pnl', '0')))
+
+                                self.logger.debug(
+                                    f"主交易所 (GRVT): total_equity={primary_info['balance']}, "
+                                    f"unrealized_pnl={primary_info['unrealized_pnl']}"
+                                )
+                        except Exception as e:
+                            self.logger.error(f"查询主交易所账户摘要失败: {e}")
+
+                    # 获取持仓（带符号）
+                    position = await self.primary_client.get_signed_position()
+                    if position is not None:
+                        primary_info['position'] = position
+
+                except Exception as e:
+                    self.logger.error(f"查询主交易所账户信息失败: {e}")
+
+            # 查询副交易所账户信息
+            if self.secondary_client:
+                try:
+                    # 🔍 DEBUG: 打印完整的 API 响应数据
+                    self.logger.info(f"🔍 [DEBUG] 正在查询副交易所 ({self.config.secondary_exchange}) 的账户信息...")
+
+                    # Extended使用X10 SDK，调用 get_balance() 获取账户余额
+                    if hasattr(self.secondary_client, 'perpetual_trading_client'):
+                        try:
+                            # X10 SDK使用 get_balance() 方法 (通过 account 模块访问)
+                            client = self.secondary_client.perpetual_trading_client
+
+                            # 调用 account.get_balance() 获取余额信息
+                            balance_response = await client.account.get_balance()
+
+                            self.logger.debug(f"🔍 [DEBUG] Extended get_balance() 返回:")
+                            self.logger.debug(f"🔍 [DEBUG] Response: {balance_response}")
+
+                            # WrappedApiResponse 包含 .data 属性
+                            if hasattr(balance_response, 'data') and balance_response.data:
+                                balance_data = balance_response.data
+
+                                # BalanceModel 包含: balance, equity, unrealised_pnl, available_for_trade, etc.
+                                secondary_info['balance'] = Decimal(str(balance_data.equity))
+                                secondary_info['unrealized_pnl'] = Decimal(str(balance_data.unrealised_pnl))
+
+                                self.logger.debug(
+                                    f"副交易所 (Extended): equity={secondary_info['balance']}, "
+                                    f"unrealised_pnl={secondary_info['unrealized_pnl']}"
+                                )
+                        except Exception as e:
+                            self.logger.error(f"查询Extended账户余额失败: {e}", exc_info=True)
+
+                    # 获取持仓（带符号）
+                    position = await self.secondary_client.get_signed_position()
+                    if position is not None:
+                        secondary_info['position'] = position
+
+                except Exception as e:
+                    self.logger.error(f"查询副交易所账户信息失败: {e}")
+
+        except Exception as e:
+            self.logger.error(f"查询账户信息失败: {e}")
+
+        return primary_info, secondary_info
+
+    async def _update_pnl(self):
+        """
+        更新 P&L 统计
+
+        通过对比当前余额与初始余额计算盈亏
+        """
+        primary_info, secondary_info = await self._fetch_account_info()
+
+        # 更新当前余额
+        if primary_info['balance'] is not None:
+            self.pnl_tracker['current_balance_primary'] = primary_info['balance']
+
+        if secondary_info['balance'] is not None:
+            self.pnl_tracker['current_balance_secondary'] = secondary_info['balance']
+
+        # 计算盈亏（如果有初始值）
+        if self.pnl_tracker['initial_balance_primary'] is not None and primary_info['balance'] is not None:
+            self.pnl_tracker['pnl_primary'] = primary_info['balance'] - self.pnl_tracker['initial_balance_primary']
+
+        if self.pnl_tracker['initial_balance_secondary'] is not None and secondary_info['balance'] is not None:
+            self.pnl_tracker['pnl_secondary'] = secondary_info['balance'] - self.pnl_tracker['initial_balance_secondary']
+
+        # 计算总盈亏
+        self.pnl_tracker['total_pnl'] = (
+            self.pnl_tracker['pnl_primary'] +
+            self.pnl_tracker['pnl_secondary']
+        )
+
+    async def _init_pnl_tracking(self):
+        """
+        初始化 P&L 追踪（记录初始余额）
+        """
+        self.logger.info("📊 初始化 P&L 追踪...")
+
+        primary_info, secondary_info = await self._fetch_account_info()
+
+        if primary_info['balance'] is not None:
+            self.pnl_tracker['initial_balance_primary'] = primary_info['balance']
+            self.pnl_tracker['current_balance_primary'] = primary_info['balance']
+            self.logger.info(f"主交易所初始余额: ${primary_info['balance']}")
+        else:
+            self.logger.warning("⚠️ 无法获取主交易所初始余额")
+
+        if secondary_info['balance'] is not None:
+            self.pnl_tracker['initial_balance_secondary'] = secondary_info['balance']
+            self.pnl_tracker['current_balance_secondary'] = secondary_info['balance']
+            self.logger.info(f"副交易所初始余额: ${secondary_info['balance']}")
+        else:
+            self.logger.warning("⚠️ 无法获取副交易所初始余额")
+
+    def _get_pnl_summary(self) -> str:
+        """
+        获取 P&L 汇总字符串
+
+        返回:
+            格式化的 P&L 统计信息
+        """
+        # 计算损耗率
+        volume_stats = ""
+        total_volume = self.pnl_tracker['total_volume_usd']
+        if total_volume > 0:
+            volume_stats = f"  总交易量: ${total_volume:,.2f}\n"
+            if total_volume >= Decimal('1'):
+                cost_per_10k = (abs(self.pnl_tracker['total_pnl']) / total_volume) * Decimal('10000')
+                volume_stats += f"  损耗率: ${cost_per_10k:.2f}/10k USDT\n"
+
+        summary = (
+            f"\n{'='*50}\n"
+            f"📊 P&L 统计\n"
+            f"{'='*50}\n"
+            f"【主交易所 - {self.config.primary_exchange.upper()}】\n"
+            f"  初始余额: ${self.pnl_tracker['initial_balance_primary'] or 0:,.2f}\n"
+            f"  当前余额: ${self.pnl_tracker['current_balance_primary'] or 0:,.2f}\n"
+            f"  盈亏: ${self.pnl_tracker['pnl_primary']:+,.2f}\n"
+            f"\n"
+            f"【副交易所 - {self.config.secondary_exchange.upper()}】\n"
+            f"  初始余额: ${self.pnl_tracker['initial_balance_secondary'] or 0:,.2f}\n"
+            f"  当前余额: ${self.pnl_tracker['current_balance_secondary'] or 0:,.2f}\n"
+            f"  盈亏: ${self.pnl_tracker['pnl_secondary']:+,.2f}\n"
+            f"\n"
+            f"【总计】\n"
+            f"  总盈亏: ${self.pnl_tracker['total_pnl']:+,.2f}\n"
+            f"{volume_stats}"
+            f"{'='*50}\n"
+        )
+
+        return summary
 
     async def initialize(self):
         """初始化交易所客户端
@@ -341,6 +548,15 @@ class DualExchangeHedge:
 
                 # 更新全局累计成交量
                 self.cumulative_filled_qty += incremental_fill
+
+                # 记录交易量（数量 × 价格 = USDT 交易额）
+                if self.current_order_price is not None:
+                    volume_usd = incremental_fill * self.current_order_price
+                    self.pnl_tracker['total_volume_usd'] += volume_usd
+                    self.logger.debug(
+                        f"📊 交易量统计: {incremental_fill} × {self.current_order_price} = ${volume_usd}, "
+                        f"累计: ${self.pnl_tracker['total_volume_usd']}"
+                    )
 
                 # 计算需要对冲的量 = 全局累计成交 - 已对冲
                 hedge_needed = self.cumulative_filled_qty - self.total_hedged_qty
@@ -563,6 +779,9 @@ class DualExchangeHedge:
             await self.initialize()
             stop_reason = "未知原因"  # 初始化成功后，重置为未知原因
 
+            # 初始化 P&L 追踪
+            await self._init_pnl_tracking()
+
             # 计算状态同步间隔（每 5% 同步一次）
             total_iterations = self.config.iterations
             last_notified_pct = -1  # 上次通知的百分比
@@ -628,17 +847,35 @@ class DualExchangeHedge:
                     else:
                         runtime_str = f"{seconds}s"
 
-                    # 构建通知消息
+                    # 构建通知消息（P&L 从内存读取，已在每轮完成后更新）
                     rtt_primary_str = f"{primary_rtt:.1f}ms" if primary_rtt else "N/A"
                     rtt_secondary_str = f"{secondary_rtt:.1f}ms" if secondary_rtt else "N/A"
+
+                    # 构建余额信息
+                    balance_info = ""
+                    if self.pnl_tracker['current_balance_primary'] is not None:
+                        balance_info += f"\n余额: {self.config.primary_exchange}=${self.pnl_tracker['current_balance_primary']:,.2f}"
+                        if self.pnl_tracker['current_balance_secondary'] is not None:
+                            balance_info += f", {self.config.secondary_exchange}=${self.pnl_tracker['current_balance_secondary']:,.2f}"
+
+                    # 构建交易量和损耗率信息
+                    volume_info = ""
+                    total_volume = self.pnl_tracker['total_volume_usd']
+                    if total_volume > 0:
+                        volume_info += f"\n交易量: ${total_volume:,.2f}"
+                        # 计算每 10000u 的损耗
+                        if total_volume >= Decimal('1'):  # 避免除以0
+                            cost_per_10k = (abs(self.pnl_tracker['total_pnl']) / total_volume) * Decimal('10000')
+                            volume_info += f"\n损耗率: ${cost_per_10k:.2f}/10k USDT"
 
                     notify_msg = (
                         f"📊 第 {iteration}/{self.config.iterations} 轮 ({current_pct}%)\n"
                         f"运行时间: {runtime_str}\n"
                         f"仓位: {self.config.primary_exchange}={primary_pos:.4f}, "
-                        f"{self.config.secondary_exchange}={secondary_pos:.4f}\n"
+                        f"{self.config.secondary_exchange}={secondary_pos:.4f}{balance_info}\n"
                         f"RTT: {self.config.primary_exchange}={rtt_primary_str}, "
-                        f"{self.config.secondary_exchange}={rtt_secondary_str}"
+                        f"{self.config.secondary_exchange}={rtt_secondary_str}\n"
+                        f"P&L: ${self.pnl_tracker['total_pnl']:+,.2f}{volume_info}"
                     )
                     await self._send_notification(notify_msg)
                     last_notified_pct = pct_milestone
@@ -675,11 +912,38 @@ class DualExchangeHedge:
                 completed_iterations = iteration  # 记录完成的轮数
                 self.logger.info(f"===== 第 {iteration} 轮交易完成 =====")
 
+                # 更新 P&L 到内存（每轮交易完成后更新，供 update_status 和里程碑通知读取）
+                await self._update_pnl()
+
             # 最终状态检查
             await self._final_position_check()
 
+            # 更新最终 P&L
+            await self._update_pnl()
+
+            # 打印 P&L 汇总到日志
+            pnl_summary = self._get_pnl_summary()
+            self.logger.info(pnl_summary)
+
             # 发送最终完成通知
             self.logger.info(f"最终统计: 完成轮数={completed_iterations}, 总轮数={self.config.iterations}, 停止原因={stop_reason}")
+
+            # 构建最终余额信息
+            final_balance_info = ""
+            if self.pnl_tracker['current_balance_primary'] is not None:
+                final_balance_info = f"\n余额: {self.config.primary_exchange}=${self.pnl_tracker['current_balance_primary']:,.2f}"
+                if self.pnl_tracker['current_balance_secondary'] is not None:
+                    final_balance_info += f", {self.config.secondary_exchange}=${self.pnl_tracker['current_balance_secondary']:,.2f}"
+
+            # 构建最终交易量和损耗率信息
+            final_volume_info = ""
+            total_volume = self.pnl_tracker['total_volume_usd']
+            if total_volume > 0:
+                final_volume_info += f"\n交易量: ${total_volume:,.2f}"
+                # 计算每 10000u 的损耗
+                if total_volume >= Decimal('1'):  # 避免除以0
+                    cost_per_10k = (abs(self.pnl_tracker['total_pnl']) / total_volume) * Decimal('10000')
+                    final_volume_info += f"\n损耗率: ${cost_per_10k:.2f}/10k USDT"
 
             if completed_iterations == self.config.iterations:
                 # 全部完成
@@ -687,7 +951,8 @@ class DualExchangeHedge:
                     f"✅ 对冲交易完成\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"完成轮数: {completed_iterations}/{self.config.iterations}\n"
-                    f"状态: 全部完成"
+                    f"状态: 全部完成{final_balance_info}\n"
+                    f"总盈亏: ${self.pnl_tracker['total_pnl']:+,.2f}{final_volume_info}"
                 )
             else:
                 # 提前中断
@@ -696,7 +961,8 @@ class DualExchangeHedge:
                     f"━━━━━━━━━━━━━━━━\n"
                     f"完成轮数: {completed_iterations}/{self.config.iterations}\n"
                     f"完成度: {int(completed_iterations/self.config.iterations*100) if self.config.iterations > 0 else 0}%\n"
-                    f"中断原因: {stop_reason}"
+                    f"中断原因: {stop_reason}{final_balance_info}\n"
+                    f"总盈亏: ${self.pnl_tracker['total_pnl']:+,.2f}{final_volume_info}"
                 )
 
             self.logger.info(final_msg.replace("\n", " | "))
@@ -962,6 +1228,7 @@ class DualExchangeHedge:
                     )
 
                     self.current_primary_order_id = result.order_id
+                    self.current_order_price = order_price  # 保存订单价格用于计算交易量
                     self.logger.info(f"订单已下: ID {result.order_id}, 价格 {order_price}")
 
                 except Exception as e:
@@ -1008,7 +1275,15 @@ class DualExchangeHedge:
                             self.logger.debug(f"价格仍是最优: {current_price}")
                     else:
                         # 订单已不存在或已成交
-                        self.current_primary_order_id = None
+                        # ✅ 在清空 order_id 之前，检查是否已完全成交
+                        # 防止在订单成交时重复下单
+                        if self.primary_filled_qty >= target_quantity:
+                            self.logger.info(f"订单已成交，准备退出循环")
+                            self.current_primary_order_id = None
+                            continue  # 回到循环开始，触发 line 1150 的检查并退出
+                        else:
+                            self.logger.info(f"订单已结束但未完全成交 ({self.primary_filled_qty}/{target_quantity})，清空order_id准备重新下单")
+                            self.current_primary_order_id = None
 
                 except Exception as e:
                     self.logger.error(f"检查价格失败: {e}")
@@ -1450,31 +1725,31 @@ class DualExchangeHedge:
 
         返回: True=状态正常可以继续, False=存在异常需要中断
         """
-        # 检查主交易所仓位
+        # 检查主交易所仓位（带符号）
         try:
-            primary_pos = await self.primary_client.get_account_positions()
+            primary_pos = await self.primary_client.get_signed_position()
             if primary_pos is None:
                 self.logger.error(f"❌ 主交易所仓位查询失败（API 调用失败，返回 None）")
                 return False
-            self.logger.info(f"主交易所当前仓位: {primary_pos}")
+            self.logger.info(f"主交易所当前仓位: {primary_pos:+.4f}")
         except Exception as e:
             self.logger.error(f"❌ 主交易所仓位查询异常: {e}", exc_info=True)
             return False
 
-        # 检查副交易所仓位
+        # 检查副交易所仓位（带符号）
         try:
-            secondary_pos = await self.secondary_client.get_account_positions()
+            secondary_pos = await self.secondary_client.get_signed_position()
             if secondary_pos is None:
                 self.logger.error(f"❌ 副交易所仓位查询失败（API 调用失败，返回 None）")
                 return False
-            self.logger.info(f"副交易所当前仓位: {secondary_pos}")
+            self.logger.info(f"副交易所当前仓位: {secondary_pos:+.4f}")
         except Exception as e:
             self.logger.error(f"❌ 副交易所仓位查询异常: {e}", exc_info=True)
             return False
 
-        # 计算净仓位
+        # 计算净仓位（带符号相加）
         net_position = primary_pos + secondary_pos
-        self.logger.info(f"净仓位: {net_position}")
+        self.logger.info(f"净仓位: {net_position:+.4f}")
 
         # 净仓位不应超过订单量的 2 倍（说明有严重的对冲失败）
         max_acceptable_net = self.config.quantity * 2
@@ -1507,15 +1782,22 @@ class DualExchangeHedge:
 
         # 如果净仓位在合理范围内，即使有小额残余也允许继续
         # 这些残余会在下一轮的清理步骤中被处理
-        if abs(net_position) <= self.config.quantity * Decimal('0.05'):  # 5% 容忍度
+        net_position_threshold = self.config.quantity * Decimal('0.05')  # 5% 容忍度
+        if abs(net_position) <= net_position_threshold:
             self.logger.info(
                 f"✅ 净仓位在可接受范围: {net_position} "
-                f"(≤ {self.config.quantity * Decimal('0.05')})"
+                f"(≤ {net_position_threshold})"
             )
         else:
-            self.logger.warning(
-                f"⚠️ 净仓位略高但仍可接受: {net_position}"
+            # ❌ 净仓位超过阈值，必须中断，不能继续交易
+            self.logger.error(
+                f"❌ 净仓位超过阈值: {net_position} (阈值: {net_position_threshold})"
             )
+            self.logger.error(
+                f"   主交易所: {primary_pos}, 副交易所: {secondary_pos}"
+            )
+            self.logger.error("   存在未平掉的仓位，需要人工检查")
+            return False
 
         # 状态检查通过，重置追踪变量
         self.primary_filled_qty = Decimal('0')
@@ -1596,6 +1878,27 @@ class DualExchangeHedge:
                 # 计算完成百分比
                 completion_pct = int((self.current_iteration / self.config.iterations * 100)) if self.config.iterations > 0 else 0
 
+                # 更新 P&L（获取最终余额）
+                await self._update_pnl()
+
+                # 构建余额信息
+                cleanup_balance_info = ""
+                if self.pnl_tracker['current_balance_primary'] is not None:
+                    cleanup_balance_info = f"\n\n余额:\n{self.config.primary_exchange}: ${self.pnl_tracker['current_balance_primary']:,.2f}"
+                    if self.pnl_tracker['current_balance_secondary'] is not None:
+                        cleanup_balance_info += f"\n{self.config.secondary_exchange}: ${self.pnl_tracker['current_balance_secondary']:,.2f}"
+                    cleanup_balance_info += f"\n总盈亏: ${self.pnl_tracker['total_pnl']:+,.2f}"
+
+                # 构建交易量和损耗率信息
+                cleanup_volume_info = ""
+                total_volume = self.pnl_tracker['total_volume_usd']
+                if total_volume > 0:
+                    cleanup_volume_info += f"\n\n交易统计:\n交易量: ${total_volume:,.2f}"
+                    # 计算每 10000u 的损耗
+                    if total_volume >= Decimal('1'):  # 避免除以0
+                        cost_per_10k = (abs(self.pnl_tracker['total_pnl']) / total_volume) * Decimal('10000')
+                        cleanup_volume_info += f"\n损耗率: ${cost_per_10k:.2f}/10k USDT"
+
                 # 发送最终通知
                 final_msg = (
                     f"🏁 对冲交易结束\n\n"
@@ -1605,7 +1908,7 @@ class DualExchangeHedge:
                     f"最终仓位:\n"
                     f"{self.config.primary_exchange}: {final_primary_pos}\n"
                     f"{self.config.secondary_exchange}: {final_secondary_pos}\n"
-                    f"净仓位: {final_primary_pos + final_secondary_pos}"
+                    f"净仓位: {final_primary_pos + final_secondary_pos}{cleanup_balance_info}{cleanup_volume_info}"
                 )
 
                 await self._send_notification(final_msg)
