@@ -549,12 +549,12 @@ class DualExchangeHedge:
                 # 更新全局累计成交量
                 self.cumulative_filled_qty += incremental_fill
 
-                # 记录交易量（数量 × 价格 = USDT 交易额）
+                # 记录主交易所交易量（数量 × 价格 = USDT 交易额）
                 if self.current_order_price is not None:
                     volume_usd = incremental_fill * self.current_order_price
                     self.pnl_tracker['total_volume_usd'] += volume_usd
                     self.logger.debug(
-                        f"📊 交易量统计: {incremental_fill} × {self.current_order_price} = ${volume_usd}, "
+                        f"📊 [主交易所] 交易量统计: {incremental_fill} × {self.current_order_price} = ${volume_usd}, "
                         f"累计: ${self.pnl_tracker['total_volume_usd']}"
                     )
 
@@ -707,7 +707,7 @@ class DualExchangeHedge:
                         if result.success:
                             self.logger.info(f"对冲订单已下单: ID {result.order_id}")
 
-                            # 等待订单成交并获取成交信息
+                            # 等待订单成交并获取成交信息（1秒后检查）
                             filled_info = await self._wait_for_hedge_fill_with_info(
                                 result.order_id, remaining_qty
                             )
@@ -715,10 +715,20 @@ class DualExchangeHedge:
                             if filled_info['success']:
                                 # 累加本次成交量
                                 filled_qty = filled_info['filled_qty']
+                                filled_price = filled_info.get('filled_price')
                                 cumulative_hedged += filled_qty
                                 self.logger.info(
                                     f"本次成交: {filled_qty}, 累计成交: {cumulative_hedged}/{quantity}"
                                 )
+
+                                # 记录副交易所交易量（数量 × 价格 = USDT 交易额）
+                                if filled_price is not None:
+                                    volume_usd = filled_qty * filled_price
+                                    self.pnl_tracker['total_volume_usd'] += volume_usd
+                                    self.logger.debug(
+                                        f"📊 [副交易所] 交易量统计: {filled_qty} × {filled_price} = ${volume_usd}, "
+                                        f"累计: ${self.pnl_tracker['total_volume_usd']}"
+                                    )
 
                                 # 检查是否完全成交
                                 if cumulative_hedged >= quantity:
@@ -734,15 +744,22 @@ class DualExchangeHedge:
                                         f"剩余 {quantity - cumulative_hedged} 将继续对冲"
                                     )
                             else:
-                                # 订单失败，取消后重试
-                                self.logger.warning(f"对冲未成交 (尝试 #{attempt})")
-                                try:
-                                    await self.secondary_client.cancel_order(
-                                        result.order_id
-                                    )
-                                    self.logger.info(f"已取消未成交对冲订单: {result.order_id}")
-                                except Exception as cancel_err:
-                                    self.logger.warning(f"取消订单失败: {cancel_err}")
+                                # 订单未成交，根据 cancel_and_retry 决定是否取消
+                                if filled_info.get('cancel_and_retry', False):
+                                    self.logger.warning(f"对冲订单1秒后未成交，取消并重试 (尝试 #{attempt})")
+                                    try:
+                                        await self.secondary_client.cancel_order(result.order_id)
+                                        self.logger.info(f"已取消未成交对冲订单: {result.order_id}")
+                                    except Exception as cancel_err:
+                                        self.logger.warning(f"取消订单失败（可能已被交易所取消）: {cancel_err}")
+                                else:
+                                    self.logger.warning(f"对冲订单失败 (尝试 #{attempt})")
+
+                                # 如果有部分成交，需要累加
+                                partial_filled = filled_info.get('filled_qty', Decimal('0'))
+                                if partial_filled > Decimal('0'):
+                                    cumulative_hedged += partial_filled
+                                    self.logger.info(f"部分成交已记录: {partial_filled}, 累计: {cumulative_hedged}/{quantity}")
                         else:
                             self.logger.warning(
                                 f"对冲下单失败 (尝试 #{attempt}): {result.error_message}"
@@ -1594,69 +1611,98 @@ class DualExchangeHedge:
 
     async def _wait_for_hedge_fill_with_info(self, order_id: str, expected_qty: Decimal, timeout: int = 30) -> dict:
         """
-        等待对冲订单成交并返回详细信息
+        等待对冲订单成交并返回详细信息（使用 WebSocket 监听）
 
         参数:
         - order_id: 订单 ID
         - expected_qty: 预期成交数量
-        - timeout: 超时时间（秒）
+        - timeout: 超时时间（秒，未使用，由上层 _execute_hedge 的30秒超时控制）
 
-        返回: {'success': bool, 'filled_qty': Decimal}
+        返回: {'success': bool, 'filled_qty': Decimal, 'filled_price': Decimal, 'cancel_and_retry': bool}
             - success: True=完全成交, False=未成交或部分成交
             - filled_qty: 实际成交数量
-        """
-        start_time = asyncio.get_event_loop().time()
-        check_interval = 2  # 每2秒检查一次
+            - filled_price: 成交价格
+            - cancel_and_retry: True=建议取消并重新下单
 
+        新逻辑:
+        - 使用 WebSocket 监听订单成交（secondary_filled_qty 由 WebSocket 回调更新）
+        - 等待1秒后检查成交状态
+        - 如果1秒后仍未成交，返回 cancel_and_retry=True，由上层取消并重新下单
+        """
         self.logger.info(f"等待对冲订单成交: {order_id}, 预期数量: {expected_qty}")
 
-        while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+        # 重置副交易所成交计数（WebSocket 会更新这个值）
+        self.secondary_filled_qty = Decimal('0')
 
-            if elapsed > timeout:
-                self.logger.warning(f"对冲订单等待超时 ({timeout}秒): {order_id}")
-                return {'success': False, 'filled_qty': Decimal('0')}
+        # 等待1秒，给 WebSocket 时间来更新
+        await asyncio.sleep(1)
 
-            # 通过 API 主动查询订单状态
+        # 检查 WebSocket 是否已经更新了成交量
+        if self.secondary_filled_qty >= expected_qty:
+            self.logger.info(f"✅ 对冲订单已成交 (WebSocket 通知): {self.secondary_filled_qty}/{expected_qty}")
+            # 通过 API 获取价格信息
             try:
                 order_info = await self.secondary_client.get_order_info(order_id)
+                filled_price = order_info.price if order_info else None
+            except:
+                filled_price = None
 
-                if order_info is None:
-                    # 订单不存在 - 可能是被立即拒绝或已经被交易所清理
-                    self.logger.warning(f"对冲订单不存在或已被清理: {order_id}，将触发重试")
-                    return {'success': False, 'filled_qty': Decimal('0')}
+            return {
+                'success': True,
+                'filled_qty': self.secondary_filled_qty,
+                'filled_price': filled_price,
+                'cancel_and_retry': False
+            }
 
-                if order_info.status == 'FILLED':
-                    # 完全成交
-                    filled_qty = order_info.filled_size
-                    self.logger.info(f"对冲订单已完全成交 (API 确认): {order_id}, 成交: {filled_qty}")
-                    return {'success': True, 'filled_qty': filled_qty}
-                elif order_info.status in ['CANCELLED', 'REJECTED', 'CANCELED']:
-                    # IOC 订单被拒绝或取消
-                    filled_qty = order_info.filled_size
-                    if filled_qty > Decimal('0'):
-                        # 部分成交
-                        self.logger.warning(
-                            f"对冲订单部分成交后被取消: {order_info.status}, "
-                            f"成交: {filled_qty}/{expected_qty}"
-                        )
-                        return {'success': True, 'filled_qty': filled_qty}
-                    else:
-                        # 完全未成交
-                        self.logger.warning(f"对冲订单被拒绝/取消: {order_info.status}, 未成交")
-                        return {'success': False, 'filled_qty': Decimal('0')}
+        # 如果1秒后仍未成交，通过 API 再次确认
+        try:
+            order_info = await self.secondary_client.get_order_info(order_id)
+
+            if order_info is None:
+                # 订单不存在
+                self.logger.warning(f"对冲订单不存在或已被清理: {order_id}")
+                return {'success': False, 'filled_qty': Decimal('0'), 'filled_price': None, 'cancel_and_retry': True}
+
+            if order_info.status == 'FILLED':
+                # 完全成交
+                filled_qty = order_info.filled_size
+                filled_price = order_info.price
+                self.logger.info(f"✅ 对冲订单已完全成交 (API 确认): {order_id}, 成交: {filled_qty} @ {filled_price}")
+                return {'success': True, 'filled_qty': filled_qty, 'filled_price': filled_price, 'cancel_and_retry': False}
+
+            elif order_info.status in ['CANCELLED', 'REJECTED', 'CANCELED']:
+                # 订单被取消或拒绝
+                filled_qty = order_info.filled_size
+                filled_price = order_info.price
+                if filled_qty > Decimal('0'):
+                    # 部分成交
+                    self.logger.warning(
+                        f"对冲订单部分成交后被取消: {order_info.status}, "
+                        f"成交: {filled_qty}/{expected_qty} @ {filled_price}"
+                    )
+                    return {'success': True, 'filled_qty': filled_qty, 'filled_price': filled_price, 'cancel_and_retry': False}
                 else:
-                    self.logger.debug(f"对冲订单状态: {order_info.status}, 成交: {order_info.filled_size}/{expected_qty}")
-            except Exception as e:
-                # 查询失败可能是订单不存在
-                error_msg = str(e).lower()
-                if 'not found' in error_msg or 'does not exist' in error_msg or '不存在' in error_msg:
-                    self.logger.warning(f"对冲订单不存在: {order_id}，错误: {e}，将触发重试")
-                    return {'success': False, 'filled_qty': Decimal('0')}
-                else:
-                    self.logger.debug(f"查询对冲订单状态失败: {e}")
+                    # 完全未成交
+                    self.logger.warning(f"对冲订单被拒绝/取消: {order_info.status}, 未成交，需要重试")
+                    return {'success': False, 'filled_qty': Decimal('0'), 'filled_price': None, 'cancel_and_retry': True}
 
-            await asyncio.sleep(check_interval)
+            else:
+                # 订单仍在挂单中，1秒后未成交 → 建议取消重新下单
+                self.logger.warning(
+                    f"⚠️ 对冲订单1秒后仍未成交 (状态: {order_info.status}), "
+                    f"成交: {order_info.filled_size}/{expected_qty}，建议取消重新下单"
+                )
+                return {'success': False, 'filled_qty': order_info.filled_size, 'filled_price': None, 'cancel_and_retry': True}
+
+        except Exception as e:
+            # 查询失败
+            error_msg = str(e).lower()
+            if 'not found' in error_msg or 'does not exist' in error_msg or '不存在' in error_msg:
+                self.logger.warning(f"对冲订单不存在: {order_id}，错误: {e}")
+                return {'success': False, 'filled_qty': Decimal('0'), 'filled_price': None, 'cancel_and_retry': True}
+            else:
+                self.logger.warning(f"查询对冲订单状态失败: {e}，建议重试")
+                return {'success': False, 'filled_qty': Decimal('0'), 'filled_price': None, 'cancel_and_retry': True}
 
     async def _check_position_balance(self) -> bool:
         """

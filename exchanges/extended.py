@@ -822,7 +822,8 @@ class ExtendedClient(BaseExchangeClient):
                         
                         if status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED']:
                             if self._order_update_handler:
-                                self._order_update_handler({
+                                # Call the handler (support both sync and async handlers)
+                                result = self._order_update_handler({
                                     'order_id': order_id,
                                     'side': side,
                                     'order_type': order_type,
@@ -832,6 +833,9 @@ class ExtendedClient(BaseExchangeClient):
                                     'contract_id': order.get('market'),
                                     'filled_size': filled_size
                                 })
+                                # If the handler is async, await it
+                                if asyncio.iscoroutine(result):
+                                    await result
                             
         except asyncio.CancelledError:
             self.logger.log("Order update handler cancelled", "INFO")
