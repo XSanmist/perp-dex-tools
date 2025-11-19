@@ -1139,16 +1139,17 @@ class DualExchangeHedge:
                 except asyncio.TimeoutError:
                     self.logger.warning("⚠️ 等待对冲平仓流程超时 (35秒)")
 
-            # Step B: 等待数据同步
-            if self.config.wait_after_open > 0:
-                self.logger.info(
-                    f"⏳ 等待 {self.config.wait_after_open} 秒，确保数据同步..."
-                )
-                await asyncio.sleep(self.config.wait_after_open)
+            # Step B: 等待数据同步（增加等待时间应对 GRVT API 延迟）
+            wait_time = max(self.config.wait_after_open, 5)  # 至少等待 5 秒
+            self.logger.info(
+                f"⏳ 等待 {wait_time} 秒，确保数据同步（应对 API 延迟）..."
+            )
+            await asyncio.sleep(wait_time)
+
 
             # Step C: 多次重试验证仓位已清空
             max_retries = self.config.balance_check_retries
-            retry_delay = 2
+            retry_delay = 3
             positions_cleared = False
 
             for attempt in range(1, max_retries + 1):
@@ -1292,12 +1293,24 @@ class DualExchangeHedge:
                             self.logger.debug(f"价格仍是最优: {current_price}")
                     else:
                         # 订单已不存在或已成交
-                        # ✅ 在清空 order_id 之前，检查是否已完全成交
-                        # 防止在订单成交时重复下单
+                        # ✅ 修复: 轮询发现订单已成交时，需要同步更新 filled_qty
+                        # 防止 WebSocket 延迟导致的重复下单
+                        if order_info and order_info.status == 'FILLED':
+                            # 从订单信息获取实际成交量，避免依赖 WebSocket 更新
+                            actual_filled = order_info.filled_size
+                            if actual_filled > self.primary_filled_qty:
+                                self.logger.info(
+                                    f"⚠️ 轮询发现订单已成交 {actual_filled}，"
+                                    f"但 WebSocket 尚未更新 ({self.primary_filled_qty})，"
+                                    f"手动同步成交量"
+                                )
+                                self.primary_filled_qty = actual_filled
+
+                        # 再次检查是否已完全成交
                         if self.primary_filled_qty >= target_quantity:
                             self.logger.info(f"订单已成交，准备退出循环")
                             self.current_primary_order_id = None
-                            continue  # 回到循环开始，触发 line 1150 的检查并退出
+                            continue  # 回到循环开始，触发 line 1221 的检查并退出
                         else:
                             self.logger.info(f"订单已结束但未完全成交 ({self.primary_filled_qty}/{target_quantity})，清空order_id准备重新下单")
                             self.current_primary_order_id = None
