@@ -49,6 +49,49 @@ def track_rtt(func: Callable):
         return sync_wrapper
 
 
+def track_api_health(func: Callable):
+    """
+    装饰器：自动跟踪 API 调用的健康状态
+
+    成功时调用 self.record_api_success()
+    失败时调用 self.record_api_failure()
+    支持同步和异步函数
+    """
+    @wraps(func)
+    async def async_wrapper(self, *args, **kwargs):
+        try:
+            result = await func(self, *args, **kwargs)
+            # API 调用成功
+            if hasattr(self, 'record_api_success'):
+                self.record_api_success()
+            return result
+        except Exception as e:
+            # API 调用失败
+            if hasattr(self, 'record_api_failure'):
+                self.record_api_failure()
+            raise
+
+    @wraps(func)
+    def sync_wrapper(self, *args, **kwargs):
+        try:
+            result = func(self, *args, **kwargs)
+            # API 调用成功
+            if hasattr(self, 'record_api_success'):
+                self.record_api_success()
+            return result
+        except Exception as e:
+            # API 调用失败
+            if hasattr(self, 'record_api_failure'):
+                self.record_api_failure()
+            raise
+
+    # 检查是否是异步函数
+    if asyncio.iscoroutinefunction(func):
+        return async_wrapper
+    else:
+        return sync_wrapper
+
+
 def query_retry(
     default_return: Any = None,
     exception_type: Union[Type[Exception], Tuple[Type[Exception], ...]] = (Exception,),
@@ -114,12 +157,27 @@ class BaseExchangeClient(ABC):
         'get_contract_attributes',
     ]
 
+    # 需要自动追踪健康状态的方法列表（关键 API 调用）
+    _HEALTH_TRACKED_METHODS = [
+        'fetch_bbo_prices',
+        'place_open_order',
+        'place_close_order',
+        'place_post_only_order',
+        'place_market_order',
+        'cancel_order',
+        'get_order_info',
+        'get_active_orders',
+        'get_account_positions',
+        'get_signed_position',
+    ]
+
     def __init_subclass__(cls, **kwargs):
         """
-        当子类被创建时，自动为指定方法添加 RTT 追踪
+        当子类被创建时，自动为指定方法添加 RTT 追踪和健康监控
         """
         super().__init_subclass__(**kwargs)
 
+        # 添加 RTT 追踪
         for method_name in cls._RTT_TRACKED_METHODS:
             if hasattr(cls, method_name):
                 original_method = getattr(cls, method_name)
@@ -127,6 +185,16 @@ class BaseExchangeClient(ABC):
                 if not getattr(original_method, '_rtt_tracked', False):
                     wrapped = track_rtt(original_method)
                     wrapped._rtt_tracked = True
+                    setattr(cls, method_name, wrapped)
+
+        # 添加健康状态追踪
+        for method_name in cls._HEALTH_TRACKED_METHODS:
+            if hasattr(cls, method_name):
+                original_method = getattr(cls, method_name)
+                # 只装饰还没被装饰过的方法
+                if not getattr(original_method, '_health_tracked', False):
+                    wrapped = track_api_health(original_method)
+                    wrapped._health_tracked = True
                     setattr(cls, method_name, wrapped)
 
     def __init__(self, config: Dict[str, Any]):
@@ -137,6 +205,10 @@ class BaseExchangeClient(ABC):
         # RTT tracking - 只保留最近 30 次请求的耗时
         self._rtt_samples = deque(maxlen=30)
         self._last_rtt = None  # 最近一次请求的 RTT
+
+        # API 健康状态跟踪
+        self.last_api_success_time = time()  # 最后一次 API 成功时间
+        self.consecutive_api_failures = 0  # 连续 API 失败次数
 
     def round_to_tick(self, price) -> Decimal:
         price = Decimal(price)
@@ -189,6 +261,37 @@ class BaseExchangeClient(ABC):
             'max': max(samples),
             'last': self._last_rtt,
             'count': len(samples)
+        }
+
+    def record_api_success(self) -> None:
+        """
+        记录 API 调用成功
+
+        由 track_api_health 装饰器自动调用
+        """
+        self.last_api_success_time = time()
+        self.consecutive_api_failures = 0
+
+    def record_api_failure(self) -> None:
+        """
+        记录 API 调用失败
+
+        由 track_api_health 装饰器自动调用
+        """
+        self.consecutive_api_failures += 1
+
+    def get_api_health_status(self) -> Dict[str, any]:
+        """
+        获取 API 健康状态
+
+        Returns:
+            包含 last_success_time, consecutive_failures, time_since_last_success 的字典
+        """
+        time_since_last_success = time() - self.last_api_success_time
+        return {
+            'last_success_time': self.last_api_success_time,
+            'consecutive_failures': self.consecutive_api_failures,
+            'time_since_last_success': time_since_last_success
         }
 
     @abstractmethod

@@ -20,8 +20,9 @@ import asyncio
 import json
 import logging
 import os
+import time
 from decimal import Decimal
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -153,6 +154,9 @@ class DualExchangeHedge:
         self.current_iteration = 0
         self.start_time = datetime.now()
 
+        # 网络健康监控配置
+        self.network_error_threshold = 180  # 网络错误阈值（秒），超过则退出程序
+
     async def update_status(self):
         """更新任务状态到共享状态文件
 
@@ -233,6 +237,83 @@ class DualExchangeHedge:
                 json.dump(status_data, f, indent=2)
         except Exception as e:
             self.logger.error(f"更新状态文件失败: {e}")
+
+    def _get_worst_api_health(self) -> Dict[str, any]:
+        """获取主副交易所中最差的 API 健康状态
+
+        返回:
+            包含 time_since_last_success, consecutive_failures, exchange_name 的字典
+        """
+        primary_health = self.primary_client.get_api_health_status() if self.primary_client else None
+        secondary_health = self.secondary_client.get_api_health_status() if self.secondary_client else None
+
+        # 找出距离上次成功时间最长的那个
+        worst_health = None
+        worst_exchange = None
+
+        if primary_health:
+            worst_health = primary_health
+            worst_exchange = self.config.primary_exchange
+
+        if secondary_health:
+            if worst_health is None or secondary_health['time_since_last_success'] > worst_health['time_since_last_success']:
+                worst_health = secondary_health
+                worst_exchange = self.config.secondary_exchange
+
+        if worst_health:
+            return {
+                **worst_health,
+                'exchange_name': worst_exchange
+            }
+        return None
+
+    async def _network_health_monitor(self):
+        """网络健康监控任务（独立异步任务）
+
+        每 30 秒检查一次两个交易所的网络健康状态
+        如果检测到任一交易所网络异常超过阈值，设置 should_stop 标志
+        """
+        check_interval = 30  # 每 30 秒检查一次
+
+        try:
+            while self.is_running and not self.should_stop:
+                await asyncio.sleep(check_interval)
+
+                # 获取最差的健康状态
+                worst_health = self._get_worst_api_health()
+
+                if not worst_health:
+                    continue
+
+                time_since_last_success = worst_health['time_since_last_success']
+                exchange_name = worst_health['exchange_name']
+                consecutive_failures = worst_health['consecutive_failures']
+
+                if time_since_last_success > self.network_error_threshold:
+                    error_msg = (
+                        f"❌ 网络健康监控: {exchange_name} 连接异常超过 {self.network_error_threshold} 秒\n"
+                        f"距离上次成功: {time_since_last_success:.1f}s\n"
+                        f"连续失败次数: {consecutive_failures}\n"
+                        f"程序将自动退出"
+                    )
+                    self.logger.error(error_msg)
+                    await self._send_notification(error_msg)
+
+                    # 设置停止标志
+                    self.should_stop = True
+                    break
+
+                elif time_since_last_success > 60:
+                    # 超过60秒但未达到阈值，记录警告
+                    self.logger.warning(
+                        f"⚠️ 网络健康监控: {exchange_name} 可能存在连接问题\n"
+                        f"   距离上次成功 API 调用: {time_since_last_success:.1f}s "
+                        f"(阈值: {self.network_error_threshold}s)\n"
+                        f"   连续失败次数: {consecutive_failures}"
+                    )
+
+        except Exception as e:
+            self.logger.error(f"网络健康监控任务异常: {e}", exc_info=True)
 
     async def _fetch_account_info(self) -> tuple:
         """
@@ -791,10 +872,15 @@ class DualExchangeHedge:
         self.is_running = True
         completed_iterations = 0  # 跟踪实际完成的轮数
         stop_reason = "初始化失败"  # 默认停止原因（如果初始化阶段失败）
+        health_monitor_task = None  # 网络健康监控任务
 
         try:
             await self.initialize()
             stop_reason = "未知原因"  # 初始化成功后，重置为未知原因
+
+            # 启动网络健康监控任务
+            health_monitor_task = asyncio.create_task(self._network_health_monitor())
+            self.logger.info(f"✅ 网络健康监控已启动 (阈值: {self.network_error_threshold}s)")
 
             # 初始化 P&L 追踪
             await self._init_pnl_tracking()
@@ -992,6 +1078,14 @@ class DualExchangeHedge:
             raise
 
         finally:
+            # 取消网络健康监控任务
+            if health_monitor_task and not health_monitor_task.done():
+                health_monitor_task.cancel()
+                try:
+                    await health_monitor_task
+                except asyncio.CancelledError:
+                    self.logger.info("网络健康监控任务已取消")
+
             await self.cleanup()
             self.is_running = False
 
@@ -1217,6 +1311,11 @@ class DualExchangeHedge:
         price_check_interval = 5  # 每 5 秒检查价格
 
         while True:
+            # 检查停止信号（由网络健康监控或用户触发）
+            if self.should_stop:
+                self.logger.warning("收到停止信号，退出订单等待循环")
+                return False
+
             # 检查是否已完全成交
             if self.primary_filled_qty >= target_quantity:
                 self.logger.info(f"订单已完全成交: {self.primary_filled_qty}/{target_quantity}")
